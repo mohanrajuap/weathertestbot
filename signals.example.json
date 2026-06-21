@@ -1,0 +1,20 @@
+{
+  "signals": [
+    {
+      "signal_id": "shanghai|2026-06-22",
+      "event_slug": "highest-temperature-in-shanghai-on-june-22-2026",
+      "city": "shanghai",
+      "target_date": "2026-06-22",
+      "temp_unit": "°C",
+      "tp_price": 0.90,
+      "sl_price": 0.20,
+      "buy_now": true,
+      "candidates": [
+        { "bucket": "33", "side": "YES", "model_prob": 0.50, "price": 0.48, "edge": 0.02, "token_id": "<yes-token-id>", "is_best": true },
+        { "bucket": "32", "side": "YES", "model_prob": 0.40, "price": 0.40, "edge": 0.00, "token_id": "<yes-token-id>", "is_best": false },
+        { "bucket": "34", "side": "YES", "model_prob": 0.08, "price": 0.06, "edge": 0.02, "token_id": "<yes-token-id>", "is_best": false }
+      ],
+      "note": "Written by signal_emitter.py when your forecast bot confirms a TRADE (buy_now=true). The trader turns 'candidates' into a Telegram menu; you pick which to buy. The bot acts once per signal_id."
+    }
+  ]
+}

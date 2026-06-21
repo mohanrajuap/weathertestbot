@@ -1,0 +1,284 @@
+# =========================================
+# pm_client.py — shared Polymarket CLOB helpers
+#
+# Order placement, price polling, balance and market resolution,
+# factored out so the interactive Telegram trader and any autonomous
+# variant share one battle-tested implementation (modeled on the BTC
+# 5m bot). Auth is lazy: nothing connects until get_client() is first
+# called, so importing this module is cheap and side-effect free.
+# =========================================
+
+import os
+import re
+import json
+import logging
+from datetime import datetime
+
+import requests
+from dotenv import load_dotenv
+from eth_account import Account
+
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import (
+    OrderArgs,
+    OrderType,
+    BalanceAllowanceParams,
+    AssetType,
+)
+from py_clob_client_v2.order_builder.constants import BUY, SELL
+
+load_dotenv()
+logger = logging.getLogger("pm_client")
+
+HOST       = "https://clob.polymarket.com"
+GAMMA      = "https://gamma-api.polymarket.com"
+
+HTTP_TIMEOUT_S  = int(os.getenv("HTTP_TIMEOUT_S", "5"))
+ENTRY_BUFFER    = float(os.getenv("ENTRY_BUFFER", "0.01"))
+ENTRY_MAX       = float(os.getenv("ENTRY_MAX", "0.97"))
+SL_CROSS_BUFFER = float(os.getenv("SL_CROSS_BUFFER", "0.02"))
+SL_FLOOR        = float(os.getenv("SL_FLOOR", "0.02"))
+
+# Log orders without sending them. Flip to false only when you trust it.
+DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() in ("1", "true", "yes", "on")
+
+# ── lazy client ──
+_client = None
+
+def get_client():
+    global _client
+    if _client is not None:
+        return _client
+    pk = os.getenv("PRIVATE_KEY")
+    fa = os.getenv("FUNDER_ADDRESS")
+    if not pk or not fa:
+        raise RuntimeError("Missing PRIVATE_KEY or FUNDER_ADDRESS in environment")
+    pk, fa = pk.strip(), fa.strip()
+    acct = Account.from_key(pk)
+    logger.info(f"🔑 Signer {acct.address.lower()} | funder {fa}")
+    c = ClobClient(host=HOST, chain_id=137, key=pk, signature_type=3, funder=fa)
+    creds = c.create_or_derive_api_key()
+    c.set_api_creds(creds)
+    logger.info("✅ Polymarket API credentials initialized")
+    _client = c
+    return c
+
+# ── price polling (public /price on a keep-alive session) ──
+PRICE_SESSION = requests.Session()
+PRICE_TIMEOUT = (2, 3)
+
+def _parse_price(d):
+    if isinstance(d, dict) and "price" in d:
+        try:
+            return float(d["price"])
+        except Exception:
+            return None
+    if isinstance(d, (int, float)):
+        return float(d)
+    return None
+
+def _price_http(token_id, side):
+    try:
+        r = PRICE_SESSION.get(
+            f"{HOST}/price",
+            params={"token_id": token_id, "side": side},
+            timeout=PRICE_TIMEOUT,
+        )
+        return _parse_price(r.json())
+    except Exception:
+        return None
+
+def best_ask(token_id):
+    p = _price_http(token_id, "BUY")
+    if p is not None:
+        return p
+    try:
+        return _parse_price(get_client().get_price(token_id, "BUY"))
+    except Exception as e:
+        logger.warning(f"⚠️ ask fetch failed: {e}")
+        return None
+
+def best_bid(token_id):
+    p = _price_http(token_id, "SELL")
+    if p is not None:
+        return p
+    try:
+        return _parse_price(get_client().get_price(token_id, "SELL"))
+    except Exception as e:
+        logger.warning(f"⚠️ bid fetch failed: {e}")
+        return None
+
+# ── market resolution ──
+def bucket_temp(s):
+    """Integer temperature from a bucket label: '36°C'→36,
+    '38°C or above'→38, bare '36'→36. None if no number."""
+    if s is None:
+        return None
+    m = re.search(r"(-?\d{1,3})\s*°?\s*[CF]", str(s)) or re.search(r"(-?\d{1,3})", str(s))
+    return int(m.group(1)) if m else None
+
+def _safe_clob_tokens(market):
+    raw = market.get("clobTokenIds")
+    if isinstance(raw, list) and len(raw) >= 2:
+        return raw[0], raw[1]
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw.replace("'", '"'))
+            return parsed[0], parsed[1]
+        except Exception as e:
+            logger.error(f"❌ token parse failed: {e}")
+    return None, None
+
+def fetch_event(event_slug):
+    try:
+        r = requests.get(f"{GAMMA}/events", params={"slug": event_slug},
+                         timeout=HTTP_TIMEOUT_S)
+        events = r.json()
+        if isinstance(events, list) and events:
+            return events[0]
+    except Exception as e:
+        logger.error(f"❌ event fetch failed for {event_slug}: {e}")
+    return None
+
+def resolve_token(event_slug, bucket, side):
+    """(token_id, market) for the sub-market matching `bucket`, on the
+    YES or NO side. (None, None) on failure."""
+    event = fetch_event(event_slug)
+    if not event:
+        return None, None
+    markets = event.get("markets", []) or []
+    want = bucket_temp(bucket)
+    match = None
+    for m in markets:
+        if want is not None and bucket_temp(m.get("groupItemTitle")) == want:
+            match = m
+            break
+    if match is None:
+        logger.error(
+            f"❌ bucket '{bucket}' not in {event_slug}: "
+            f"{[m.get('groupItemTitle') for m in markets]}"
+        )
+        return None, None
+    yes_t, no_t = _safe_clob_tokens(match)
+    if not yes_t or not no_t:
+        return None, None
+    return (yes_t if str(side).upper() == "YES" else no_t), match
+
+def market_end_ts(market):
+    if not market:
+        return None
+    for key in ("endDate", "endDateIso", "end_date_iso"):
+        v = market.get(key)
+        if not v:
+            continue
+        try:
+            return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+    return None
+
+# ── orders ──
+def place_buy(token_id, ask, max_price, shares):
+    """Marketable GTC buy capped at min(max_price, ENTRY_MAX).
+    Returns (order_id, limit_price) or (None, None)."""
+    cap = min(max_price, ENTRY_MAX)
+    if ask is None:
+        logger.warning("⚠️ no ask — skip buy")
+        return None, None
+    if ask > cap:
+        logger.warning(f"⚠️ ask {ask:.3f} > cap {cap:.3f} — skip buy")
+        return None, None
+    limit = min(round(ask + ENTRY_BUFFER, 3), cap)
+    logger.info(f"🎯 BUY limit {limit:.3f} x {shares}")
+    if DRY_RUN:
+        logger.info("🧪 DRY_RUN — buy not sent")
+        return "DRYRUN-BUY", limit
+    try:
+        args = OrderArgs(token_id=token_id, price=limit, size=shares, side=BUY)
+        resp = get_client().create_and_post_order(args, order_type=OrderType.GTC)
+        logger.info(f"✅ BUY resp: {resp}")
+        return (resp.get("orderID") or resp.get("id")), limit
+    except Exception as e:
+        logger.error(f"❌ buy failed: {e}")
+        return None, None
+
+def place_sell(token_id, price, shares, label="SELL"):
+    logger.info(f"💱 {label} limit {price} x {shares}")
+    if DRY_RUN:
+        logger.info(f"🧪 DRY_RUN — {label} not sent")
+        return f"DRYRUN-{label}"
+    try:
+        args = OrderArgs(token_id=token_id, price=price, size=shares, side=SELL)
+        resp = get_client().create_and_post_order(args, order_type=OrderType.GTC)
+        logger.info(f"✅ {label} resp: {resp}")
+        return resp.get("orderID") or resp.get("id")
+    except Exception as e:
+        logger.error(f"❌ {label} failed: {e}")
+        return None
+
+def sell_cross_book(token_id, shares, label="SELL"):
+    """Cross the book: sell at live bid − buffer, floored at SL_FLOOR."""
+    bid = best_bid(token_id)
+    px = max(round((bid - SL_CROSS_BUFFER), 3), SL_FLOOR) if bid is not None else SL_FLOOR
+    oid = place_sell(token_id, px, shares, label=label)
+    if oid is None:
+        oid = place_sell(token_id, SL_FLOOR, shares, label=label + "-RETRY")
+    return oid, px
+
+def get_filled_size(order_id):
+    if not order_id:
+        return 0.0
+    if isinstance(order_id, str) and order_id.startswith("DRYRUN"):
+        return -1.0  # sentinel: treat dry-run as "filled" by caller
+    try:
+        status = get_client().get_order(order_id)
+        if not status:
+            return 0.0
+        matched = status.get("size_matched")
+        if matched is None:
+            s = str(status.get("status", "")).lower()
+            if s in ("filled", "matched"):
+                return float(status.get("original_size", 0) or 0)
+            return 0.0
+        return float(matched)
+    except Exception as e:
+        logger.error(f"❌ order status failed: {e}")
+        return 0.0
+
+def cancel_order(order_id):
+    if not order_id:
+        return False
+    if isinstance(order_id, str) and order_id.startswith("DRYRUN"):
+        return True
+    for name, call in (
+        ("cancel",        lambda f: f(order_id)),
+        ("cancel_order",  lambda f: f(order_id)),
+        ("cancel_orders", lambda f: f([order_id])),
+    ):
+        fn = getattr(get_client(), name, None)
+        if fn is None:
+            continue
+        try:
+            call(fn)
+            logger.info(f"🗑️ cancelled {order_id} via .{name}()")
+            return True
+        except Exception as e:
+            logger.warning(f"⚠️ .{name}() failed: {e}")
+    logger.error(f"❌ could not cancel {order_id} — cancel in UI")
+    return False
+
+def token_balance(token_id):
+    try:
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.CONDITIONAL, token_id=token_id, signature_type=3,
+        )
+        try:
+            get_client().update_balance_allowance(params)
+        except Exception as e:
+            logger.warning(f"⚠️ balance refresh failed: {e}")
+        resp = get_client().get_balance_allowance(params)
+        raw = resp.get("balance") if isinstance(resp, dict) else None
+        return float(raw) / 1_000_000.0 if raw is not None else 0.0
+    except Exception as e:
+        logger.error(f"❌ balance failed: {e}")
+        return 0.0

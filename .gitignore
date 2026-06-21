@@ -1,0 +1,9 @@
+.env
+*_log.txt
+trader_state.json
+weather_bot_state.json
+signals.json
+__pycache__/
+*.pyc
+venv/
+.venv/
