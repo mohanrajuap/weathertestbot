@@ -22,6 +22,7 @@
 import os
 import sys
 import json
+import math
 import time
 import logging
 import threading
@@ -51,6 +52,8 @@ DEFAULT_SL_PRICE = float(os.getenv("SL_PRICE", "0.20"))
 
 USD_PRESETS    = [float(x) for x in os.getenv("USD_PRESETS", "1,5,10,25,50").split(",")]
 SHARE_PRESETS  = [int(float(x)) for x in os.getenv("SHARE_PRESETS", "5,10,25,50").split(",")]
+# Polymarket rejects marketable orders below ~$1 notional; size up to clear it.
+MIN_ORDER_USD  = float(os.getenv("MIN_ORDER_USD", "1.0"))
 DEFAULT_UNIT   = os.getenv("DEFAULT_UNIT", "USD").strip().upper()  # USD | SHARES
 
 SIGNAL_POLL_S   = float(os.getenv("SIGNAL_POLL_S", "5"))
@@ -331,16 +334,26 @@ def build_test_signal(slug):
 # ===================== BUY EXECUTION =====================
 
 def _shares_for(candidate, unit, amount):
-    """Resolve the order size in shares for one position."""
-    if unit == "SHARES":
-        return max(1, int(round(amount)))
-    # USD → shares at the live ask (fallback to the signal's market price)
+    """Resolve the order size in shares for one position, guaranteeing the
+    notional clears Polymarket's marketable-order minimum (~$1). Polymarket
+    computes that minimum on the BEST ASK (its 400 showed 2×$0.36=$0.72), so
+    we size on the ask too and round UP."""
     token = candidate.get("token_id")
     ask = pm.best_ask(token) if token else None
     price = ask or candidate.get("price") or 0.5
     if price <= 0:
         price = 0.5
-    return max(1, int(amount // price))
+
+    if unit == "SHARES":
+        shares = max(1, int(round(amount)))
+    else:  # USD → shares; never below the $1 min notional
+        target = max(float(amount), MIN_ORDER_USD)
+        shares = max(1, math.ceil(target / price))
+
+    # precision-safe guarantee that shares*price >= the exchange minimum
+    while shares * price < MIN_ORDER_USD - 1e-6:
+        shares += 1
+    return shares
 
 def execute_buys(sess, cb_chat):
     if not sess["selected"]:
@@ -397,7 +410,8 @@ def execute_buys(sess, cb_chat):
                 "status": "open", "chat_id": sess["chat_id"],
             }
             results.append(
-                f"✅ {bucket}{sess['unit_sym']}: bought {held} sh @ ~{limit:.2f} (pid {pid})"
+                f"✅ {bucket}{sess['unit_sym']}: bought {held} sh @ ~{limit:.2f} "
+                f"(~${held * (ask or limit):.2f}, pid {pid})"
             )
             save_state()
 
