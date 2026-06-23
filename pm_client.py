@@ -45,6 +45,27 @@ DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() in ("1", "true", "yes", 
 # ── lazy client ──
 _client = None
 
+_HEX = set("0123456789abcdefABCDEF")
+
+def _clean_secret(s):
+    """Strip whitespace and any surrounding quotes — Railway/.env values
+    are frequently pasted as \"0xabc...\" (quotes included) or with a stray
+    newline, which makes eth-account raise 'Non-hexadecimal digit found'."""
+    return (s or "").strip().strip('"').strip("'").strip()
+
+def _normalize_private_key(pk):
+    pk = _clean_secret(pk)
+    body = pk[2:] if pk.lower().startswith("0x") else pk
+    if len(body) != 64 or any(c not in _HEX for c in body):
+        bad = next((c for c in body if c not in _HEX), None)
+        hint = (f"contains a non-hex character {bad!r}" if bad
+                else f"is {len(body)} hex chars, expected 64")
+        raise RuntimeError(
+            "PRIVATE_KEY is invalid: it " + hint + ". Set it to your 64-char "
+            "hex key (0x-prefix optional) with NO surrounding quotes or spaces."
+        )
+    return "0x" + body
+
 def get_client():
     global _client
     if _client is not None:
@@ -53,7 +74,8 @@ def get_client():
     fa = os.getenv("FUNDER_ADDRESS")
     if not pk or not fa:
         raise RuntimeError("Missing PRIVATE_KEY or FUNDER_ADDRESS in environment")
-    pk, fa = pk.strip(), fa.strip()
+    pk = _normalize_private_key(pk)
+    fa = _clean_secret(fa)
     acct = Account.from_key(pk)
     logger.info(f"🔑 Signer {acct.address.lower()} | funder {fa}")
     c = ClobClient(host=HOST, chain_id=137, key=pk, signature_type=3, funder=fa)

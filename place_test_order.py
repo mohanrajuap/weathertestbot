@@ -64,7 +64,12 @@ def make_client():
     fa = os.getenv("FUNDER_ADDRESS")
     if not pk or not fa:
         die("Missing PRIVATE_KEY or FUNDER_ADDRESS in .env")
-    pk, fa = pk.strip(), fa.strip()
+    # strip whitespace + any surrounding quotes (common Railway paste error
+    # that triggers 'Non-hexadecimal digit found')
+    pk = pk.strip().strip('"').strip("'").strip()
+    fa = fa.strip().strip('"').strip("'").strip()
+    if not pk.lower().startswith("0x"):
+        pk = "0x" + pk
     acct = Account.from_key(pk)
     print(f"🔑 Signer  : {acct.address.lower()}")
     print(f"🏦 Funder  : {fa}")

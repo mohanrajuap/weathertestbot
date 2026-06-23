@@ -49,7 +49,7 @@ STATE_FILE   = os.getenv("STATE_FILE", "trader_state.json")
 DEFAULT_TP_PRICE = float(os.getenv("TP_PRICE", "0.90"))
 DEFAULT_SL_PRICE = float(os.getenv("SL_PRICE", "0.20"))
 
-USD_PRESETS    = [float(x) for x in os.getenv("USD_PRESETS", "5,10,25,50").split(",")]
+USD_PRESETS    = [float(x) for x in os.getenv("USD_PRESETS", "1,5,10,25,50").split(",")]
 SHARE_PRESETS  = [int(float(x)) for x in os.getenv("SHARE_PRESETS", "5,10,25,50").split(",")]
 DEFAULT_UNIT   = os.getenv("DEFAULT_UNIT", "USD").strip().upper()  # USD | SHARES
 
