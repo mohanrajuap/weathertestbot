@@ -52,6 +52,12 @@ DEFAULT_SL_PRICE = float(os.getenv("SL_PRICE", "0.20"))
 
 USD_PRESETS    = [float(x) for x in os.getenv("USD_PRESETS", "1,5,10,25,50").split(",")]
 SHARE_PRESETS  = [int(float(x)) for x in os.getenv("SHARE_PRESETS", "5,10,25,50").split(",")]
+# Always keep the $1 / 5-share minimum as a one-tap option even if an old
+# env var omits it.
+if 1.0 not in USD_PRESETS:
+    USD_PRESETS = [1.0] + USD_PRESETS
+if 5 not in SHARE_PRESETS:
+    SHARE_PRESETS = [5] + SHARE_PRESETS
 # Polymarket rejects orders below BOTH a ~$1 notional AND a 5-share minimum.
 MIN_ORDER_USD  = float(os.getenv("MIN_ORDER_USD", "1.0"))
 MIN_SHARES     = int(os.getenv("MIN_SHARES", "5"))
@@ -233,11 +239,13 @@ def render_keyboard(sess):
     s = sess
     sid = s["sid"]
     kb = []
-    # one toggle button per candidate
+    # one toggle button per candidate (price + upside if it wins)
     for i, c in enumerate(s["candidates"]):
         chk = "☑️" if i in s["selected"] else "▫️"
+        price = c.get("price")
+        win = f" · win +{(1.0 - price) * 100:.0f}¢" if isinstance(price, (int, float)) else ""
         kb.append([{
-            "text": f"{chk} {c['bucket']}{s['unit_sym']} · {_fmt_pct(c.get('model_prob'))} · {_fmt_cents(c.get('price'))}",
+            "text": f"{chk} {c['bucket']}{s['unit_sym']} · {_fmt_cents(price)}{win}",
             "callback_data": f"b|{sid}|t|{i}",
         }])
     # unit row
