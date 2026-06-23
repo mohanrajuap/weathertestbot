@@ -163,6 +163,23 @@ def fetch_event(event_slug):
         logger.error(f"❌ event fetch failed for {event_slug}: {e}")
     return None
 
+def list_temperature_events(limit=300):
+    """All LIVE 'Highest temperature in <city> on <date>' events across every
+    city, via the 'highest-temperature' tag. Returns the raw event list."""
+    try:
+        r = requests.get(
+            f"{GAMMA}/events",
+            params={"active": "true", "closed": "false",
+                    "tag_slug": "highest-temperature", "limit": limit,
+                    "order": "startDate", "ascending": "false"},
+            timeout=HTTP_TIMEOUT_S + 5,
+        )
+        d = r.json()
+        return d if isinstance(d, list) else []
+    except Exception as e:
+        logger.error(f"❌ temperature events fetch failed: {e}")
+        return []
+
 def resolve_token(event_slug, bucket, side):
     """(token_id, market) for the sub-market matching `bucket`, on the
     YES or NO side. (None, None) on failure."""

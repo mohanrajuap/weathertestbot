@@ -55,7 +55,7 @@ SHARE_PRESETS  = [int(float(x)) for x in os.getenv("SHARE_PRESETS", "5,10,25,50"
 # Polymarket rejects orders below BOTH a ~$1 notional AND a 5-share minimum.
 MIN_ORDER_USD  = float(os.getenv("MIN_ORDER_USD", "1.0"))
 MIN_SHARES     = int(os.getenv("MIN_SHARES", "5"))
-DEFAULT_UNIT   = os.getenv("DEFAULT_UNIT", "USD").strip().upper()  # USD | SHARES
+DEFAULT_UNIT   = os.getenv("DEFAULT_UNIT", "SHARES").strip().upper()  # SHARES | USD
 
 SIGNAL_POLL_S   = float(os.getenv("SIGNAL_POLL_S", "5"))
 MONITOR_POLL_S  = float(os.getenv("MONITOR_POLL_S", "5"))
@@ -279,22 +279,28 @@ def handle_new_signal(sig):
         "message_id": None,
         "status": "pending",
     }
-    # pre-select the model's best candidate for convenience
-    for i, c in enumerate(cands):
-        if c.get("is_best"):
-            sess["selected"].add(i)
-            break
+    # NOTE: nothing is pre-selected — you only buy buckets you explicitly
+    # tap, so a card can never place a position you didn't choose.
     sessions[sid] = sess
     push_card(sess)
     processed.add(sid_key)
     save_state()
     logger.info(f"📨 Sent trade card {sid} for {sid_key} ({len(cands)} candidates)")
 
+def _parse_temp_slug(slug):
+    """'highest-temperature-in-mexico-city-on-june-24-2026' →
+    ('Mexico City', 'June 24 2026')."""
+    try:
+        rest = slug.split("-in-", 1)[1]
+        city, date = rest.split("-on-", 1)
+        return city.replace("-", " ").title(), date.replace("-", " ").title()
+    except Exception:
+        return slug, ""
+
 def build_test_signal(slug):
-    """Build a signal from a LIVE temperature event so you can rehearse
-    the whole Telegram → buy flow without the forecast bot. Pulls the
-    real buckets/prices/tokens off Gamma; model_prob is left unknown
-    (shown as '?') since there's no forecast behind a manual test."""
+    """Build a signal from a LIVE temperature event so you can buy from any
+    market without the forecast bot. Pulls the real buckets/prices/tokens off
+    Gamma; model_prob is unknown (shown as '?') since there's no forecast."""
     ev = pm.fetch_event(slug)
     if not ev:
         return None
@@ -317,32 +323,71 @@ def build_test_signal(slug):
         })
     # favorites first (highest YES price), keep it to a tidy menu
     cands.sort(key=lambda c: c["price"], reverse=True)
-    cands = cands[:5]
+    cands = cands[:6]
     if not cands:
         return None
     cands[0]["is_best"] = True
-    try:
-        city = slug.split("-in-")[-1].split("-on-")[0]
-    except Exception:
-        city = "test"
+    city, date = _parse_temp_slug(slug)
     return {
-        "signal_id": f"TEST|{slug}|{int(time.time())}",   # unique each /test
-        "event_slug": slug, "city": city, "target_date": "TEST",
+        "signal_id": f"{slug}|{int(time.time())}",   # unique each open
+        "event_slug": slug, "city": city, "target_date": date or "—",
         "temp_unit": "°C", "tp_price": DEFAULT_TP_PRICE,
         "sl_price": DEFAULT_SL_PRICE, "buy_now": True, "candidates": cands,
     }
 
+# ── live-markets browser ──
+markets_cache = {}   # chat_id -> [(slug, city, date), …]
+
+def _send_markets_menu(chat, city_filter=None):
+    send_message(chat, "🔎 Scanning live temperature markets …")
+    events = pm.list_temperature_events()
+    rows, seen = [], set()
+    for e in events:
+        slug = e.get("slug") or ""
+        if not slug or slug in seen:
+            continue
+        city, date = _parse_temp_slug(slug)
+        if city_filter and city_filter not in city.lower():
+            continue
+        seen.add(slug)
+        rows.append((slug, city, date))
+    if not rows:
+        send_message(chat, "No live temperature markets found"
+                     + (f" for '{city_filter}'." if city_filter else "."))
+        return
+    rows.sort(key=lambda r: (r[1], r[2]))
+    rows = rows[:40]                       # keep the keyboard tidy
+    markets_cache[str(chat)] = rows
+    kb, row = [], []
+    for i, (slug, city, date) in enumerate(rows):
+        row.append({"text": f"{city} · {date}", "callback_data": f"m|{i}"})
+        if len(row) == 2:
+            kb.append(row); row = []
+    if row:
+        kb.append(row)
+    send_message(chat,
+        f"🌡️ <b>{len(rows)} live temperature markets</b>"
+        + (f" matching '{city_filter}'" if city_filter else "")
+        + "\nTap one to get its buy card:", kb)
+
 # ===================== BUY EXECUTION =====================
 
-def _dollars_for(unit, amount, ask):
-    """Dollar amount to spend on a MARKET buy for one position, honoring
-    your input but never below Polymarket's minimums (≥ $MIN_ORDER_USD AND
-    ≥ MIN_SHARES at the live ask). Returns (dollars, bumped_bool)."""
+def _shares_for(unit, amount, ask):
+    """WHOLE share count for one position (no fractional fills). Buying is
+    share-based; we place a marketable LIMIT order for this many shares.
+    Honors your input but never below Polymarket's minimums — at least
+    MIN_SHARES (5) AND enough shares that shares×price ≥ MIN_ORDER_USD ($1).
+    Returns (shares, bumped_bool)."""
     price = ask if (ask and ask > 0) else 0.5
-    want = float(amount) if unit == "USD" else float(amount) * price  # SHARES→$
-    floor = max(MIN_ORDER_USD, MIN_SHARES * price)
-    dollars = round(max(want, floor) + 1e-9, 2)
-    return dollars, (dollars > want + 0.01)
+    if unit == "SHARES":
+        want = int(round(float(amount)))
+        shares = max(MIN_SHARES, want)
+    else:  # USD → whole shares
+        want = max(1, int(float(amount) // price))
+        shares = max(MIN_SHARES, math.ceil(max(float(amount), MIN_ORDER_USD) / price))
+    while shares * price < MIN_ORDER_USD - 1e-6:
+        shares += 1
+    return shares, (shares > want)
 
 def execute_buys(sess, cb_chat):
     if not sess["selected"]:
@@ -372,23 +417,24 @@ def execute_buys(sess, cb_chat):
             if ask is None:
                 results.append(f"❌ {bucket}{sess['unit_sym']}: no live price")
                 continue
-            dollars, bumped = _dollars_for(sess["unit"], sess["amount"], ask)
+            shares, bumped = _shares_for(sess["unit"], sess["amount"], ask)
+            max_price = round(ask + 0.05, 3)  # marketable limit: cross to fill
 
-            oid, spent = pm.place_market_buy(token, dollars)
+            oid, limit = pm.place_buy(token, ask, max_price, shares)
             if not oid:
                 results.append(f"❌ {bucket}{sess['unit_sym']}: order rejected")
                 continue
 
-            # confirm fill (FOK fills fully or kills)
+            # confirm fill
             filled = _await_fill(oid)
             if filled == 0:
-                results.append(f"⚠️ {bucket}{sess['unit_sym']}: not filled (killed)")
+                pm.cancel_order(oid)
+                results.append(f"⚠️ {bucket}{sess['unit_sym']}: not filled, cancelled")
                 continue
-            held = int(round(dollars / ask)) if filled < 0 else int(filled)  # <0=dry-run
+            held = shares if filled < 0 else int(filled)  # <0 = dry-run sentinel
             if held <= 0:
                 results.append(f"⚠️ {bucket}{sess['unit_sym']}: 0 shares filled")
                 continue
-            entry = round(dollars / held, 3)
 
             pid = _next_pid()
             end_ts = pm.market_end_ts(market) or (time.time() + MAX_HOLD_HOURS * 3600)
@@ -396,15 +442,15 @@ def execute_buys(sess, cb_chat):
                 "pid": pid, "token_id": token, "bucket": bucket, "side": side,
                 "city": sess["city"], "target_date": sess["target_date"],
                 "event_slug": sess["event_slug"], "unit_sym": sess["unit_sym"],
-                "shares": held, "entry_price": entry,
+                "shares": held, "entry_price": limit,
                 "tp_price": sess["tp_price"], "sl_price": sess["sl_price"],
                 "end_ts": end_ts, "tp_done": False, "sl_done": False,
                 "status": "open", "chat_id": sess["chat_id"],
             }
-            note = (f" — bumped to {MIN_SHARES}-share/$1 min" if bumped else "")
+            note = (f" — min {MIN_SHARES}sh/$1" if bumped else "")
             results.append(
-                f"✅ {bucket}{sess['unit_sym']}: market-bought ~{held} sh "
-                f"for ~${dollars:.2f}{note} (pid {pid})"
+                f"✅ {bucket}{sess['unit_sym']}: bought {held} sh @ ~{limit:.2f} "
+                f"(~${held * limit:.2f}{note}, pid {pid})"
             )
             save_state()
 
@@ -524,6 +570,32 @@ def handle_callback(cb):
                                f"I'll prompt again if it hits the other level.")
         return
 
+    # ── markets-browser pick → build that event's card ──
+    if kind == "m" and len(parts) >= 2:
+        rows = markets_cache.get(chat) or []
+        try:
+            idx = int(parts[1])
+        except ValueError:
+            idx = -1
+        if not (0 <= idx < len(rows)):
+            answer_callback(cb_id, "List expired — send /markets again")
+            return
+        slug = rows[idx][0]
+        answer_callback(cb_id, "Loading market…")
+
+        def _open():
+            try:
+                sig = build_test_signal(slug)
+            except Exception as e:
+                sig = None
+                logger.warning(f"markets pick build failed: {e}")
+            if not sig or not sig.get("candidates"):
+                send_message(chat, f"⚠️ No tradeable buckets for <code>{slug}</code>")
+            else:
+                handle_new_signal(sig)
+        threading.Thread(target=_open, daemon=True).start()
+        return
+
     answer_callback(cb_id)
 
 def handle_text(msg):
@@ -538,10 +610,16 @@ def handle_text(msg):
         if cmd in ("/start", "/help"):
             send_message(chat,
                 "🌡️ <b>Weather Trader</b>\nI send a card when your forecast bot "
-                "finds a trade. Tap positions, set unit + amount, Confirm. "
-                "I ask before every sell.\n\n"
-                "/test [event-slug] — send a card from a LIVE market to rehearse\n"
+                "finds a trade. Tap the bucket(s) you want, set amount, Confirm. "
+                "Nothing is pre-selected and I ask before every sell.\n\n"
+                "/markets [city] — browse ALL live temperature markets and pick one\n"
+                "/test [event-slug] — card from a specific live event\n"
                 "/positions — list open trades\n/help — this message")
+        elif cmd == "/markets":
+            parts = text.split(maxsplit=1)
+            city_filter = parts[1].strip().lower() if len(parts) > 1 else None
+            threading.Thread(target=_send_markets_menu, args=(chat, city_filter),
+                             daemon=True).start()
         elif cmd == "/test":
             parts = text.split()
             slug = parts[1] if len(parts) > 1 else os.getenv("TEST_EVENT_SLUG", DEFAULT_TEST_SLUG)

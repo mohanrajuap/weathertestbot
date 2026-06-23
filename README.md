@@ -145,9 +145,20 @@ TP/SL and asks before selling, exactly as in production.
 > Find a live slug from any `polymarket.com/event/<slug>` temperature page,
 > or set `TEST_EVENT_SLUG` so bare `/test` always works.
 
+## Browse every live market (`/markets`)
+
+```
+/markets            # all live "highest temperature in <city>" events, as buttons
+/markets tokyo      # filter to a city
+```
+Tap any market → you get its buy card. Buys are **share-based** (whole
+shares, marketable limit orders — no fractional fills) and **nothing is
+pre-selected**: you only buy the bucket(s) you tap. Minimum order is 5
+shares AND ≥ $1, enforced automatically.
+
 ## Commands & safety
 
-- Telegram: `/test [slug]` (rehearse a buy), `/positions` (list open trades), `/help`.
+- Telegram: `/markets [city]` (browse all markets), `/test [slug]` (specific event), `/positions`, `/help`.
 - Only `TELEGRAM_CHAT_ID`(s) can press buttons; others are ignored.
 - `trader_state.json` persists open positions + handled signals across
   restarts — keep it on the Railway volume.
