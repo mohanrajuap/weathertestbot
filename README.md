@@ -151,10 +151,21 @@ TP/SL and asks before selling, exactly as in production.
 /markets            # all live "highest temperature in <city>" events, as buttons
 /markets tokyo      # filter to a city
 ```
+`/markets` shows the **nearest upcoming day per city** (today's market
+first, past days dropped). `/markets <city>` lists that city's available
+days. Only **"highest temperature in …"** events appear — never a city's
+lowest-temperature or precipitation markets.
+
 Tap any market → you get its buy card. Buys are **share-based** (whole
 shares, marketable limit orders — no fractional fills) and **nothing is
 pre-selected**: you only buy the bucket(s) you tap. Minimum order is 5
 shares AND ≥ $1, enforced automatically.
+
+### Edge calculator (on every card)
+Each bucket shows its upside if it wins (a YES share pays $1): e.g.
+`33°C · mkt 45¢ · win +55¢`. When you select multiple buckets the card
+computes the combined edge — buy 33°C @45¢ + 32°C @40¢ = **85¢/set → $1 if
+it lands in either → +15¢ (18%)**, "no loss if the high is in your range."
 
 ## Commands & safety
 

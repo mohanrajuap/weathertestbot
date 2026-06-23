@@ -191,17 +191,41 @@ def render_card(sess):
     for i, c in enumerate(s["candidates"]):
         chk = "☑️" if i in s["selected"] else "▫️"
         star = "⭐" if c.get("is_best") else ""
+        price = c.get("price")
+        # per-share upside if THIS bucket wins: a YES share pays $1, so
+        # profit = (1 - price). e.g. 45¢ → +55¢/sh.
+        win = f"win +{(1.0 - price) * 100:.0f}¢" if isinstance(price, (int, float)) else ""
         lines.append(
             f"{chk} <b>{c['bucket']}{s['unit_sym']}</b> {star} · "
-            f"model {_fmt_pct(c.get('model_prob'))} · mkt {_fmt_cents(c.get('price'))}"
+            f"mkt {_fmt_cents(price)} · {win}"
         )
-    sel = ", ".join(f"{s['candidates'][i]['bucket']}{s['unit_sym']}" for i in sorted(s["selected"])) or "—"
+
+    sel_idx = sorted(s["selected"])
+    sel = ", ".join(f"{s['candidates'][i]['bucket']}{s['unit_sym']}" for i in sel_idx) or "—"
     amt_str = (f"${amt:g}" if unit == "USD" else f"{amt:g} sh") if amt else "—"
+
+    # ── edge calculator for the SELECTED combination ──
+    edge_line = ""
+    if sel_idx:
+        cost = sum((s["candidates"][i].get("price") or 0.0) for i in sel_idx)
+        edge = 1.0 - cost
+        ret = (edge / cost * 100) if cost > 0 else 0
+        if len(sel_idx) == 1:
+            edge_line = (f"\n🧮 <b>Edge</b>: pay {cost*100:.0f}¢ → $1 if it hits · "
+                         f"+{edge*100:.0f}¢/sh ({ret:.0f}%)")
+        elif edge > 0:
+            edge_line = (f"\n🧮 <b>Edge</b>: {len(sel_idx)} buckets cost {cost*100:.0f}¢/set → "
+                         f"$1 if it lands in any · +{edge*100:.0f}¢/set ({ret:.0f}%) — "
+                         f"<i>no loss if the high is in your range</i>")
+        else:
+            edge_line = (f"\n🧮 <b>Edge</b>: {len(sel_idx)} buckets cost {cost*100:.0f}¢/set ≥ $1 → "
+                         f"<i>no edge (overpriced together)</i>")
+
     foot = (
-        f"\nSelected: <b>{sel}</b>\n"
+        f"\nSelected: <b>{sel}</b>{edge_line}\n"
         f"Unit: <b>{'💵 USD' if unit=='USD' else '📊 Shares'}</b> · "
         f"Amount: <b>{amt_str}</b>"
-        + ("  (applied to each position)" if len(s["selected"]) > 1 else "")
+        + ("  (applied to each)" if len(sel_idx) > 1 else "")
     )
     return head + "\n".join(lines) + foot
 
@@ -294,6 +318,10 @@ HIGHEST_TEMP_PREFIX = "highest-temperature-in-"
 def _is_highest_temp_slug(slug):
     return bool(slug) and str(slug).startswith(HIGHEST_TEMP_PREFIX)
 
+_MONTHS = {m.lower(): i for i, m in enumerate(
+    ["January", "February", "March", "April", "May", "June", "July",
+     "August", "September", "October", "November", "December"], start=1)}
+
 def _parse_temp_slug(slug):
     """'highest-temperature-in-mexico-city-on-june-24-2026' →
     ('Mexico City', 'June 24 2026')."""
@@ -303,6 +331,17 @@ def _parse_temp_slug(slug):
         return city.replace("-", " ").title(), date.replace("-", " ").title()
     except Exception:
         return slug, ""
+
+def _slug_date(slug):
+    """Date object for the event's day, or None. Used to prioritize TODAY's
+    market and drop already-passed ones."""
+    try:
+        rest = slug.split("-on-", 1)[1]          # 'june-24-2026'
+        mon, day, year = rest.split("-")
+        from datetime import date as _date
+        return _date(int(year), _MONTHS[mon.lower()], int(day))
+    except Exception:
+        return None
 
 def build_test_signal(slug):
     """Build a signal from a LIVE temperature event so you can buy from any
@@ -351,36 +390,55 @@ def build_test_signal(slug):
 markets_cache = {}   # chat_id -> [(slug, city, date), …]
 
 def _send_markets_menu(chat, city_filter=None):
+    from datetime import date as _date
     send_message(chat, "🔎 Scanning live temperature markets …")
     events = pm.list_temperature_events()
-    rows, seen = [], set()
+    today = _date.today()
+
+    parsed, seen = [], set()
     for e in events:
         slug = e.get("slug") or ""
-        # double safety on top of the tag filter: highest-temperature only
         if not _is_highest_temp_slug(slug) or slug in seen:
             continue
-        city, date = _parse_temp_slug(slug)
+        d = _slug_date(slug)
+        if d is None or d < today:           # drop already-passed days
+            continue
+        city, date_label = _parse_temp_slug(slug)
         if city_filter and city_filter not in city.lower():
             continue
         seen.add(slug)
-        rows.append((slug, city, date))
-    if not rows:
+        parsed.append((d, city, slug, date_label))
+
+    if not parsed:
         send_message(chat, "No live temperature markets found"
                      + (f" for '{city_filter}'." if city_filter else "."))
         return
-    rows.sort(key=lambda r: (r[1], r[2]))
-    rows = rows[:40]                       # keep the keyboard tidy
+
+    parsed.sort(key=lambda x: (x[0], x[1]))   # soonest date first, then city
+    if city_filter:
+        # show every upcoming date for that city (today first)
+        rows = [(slug, city, dl) for (d, city, slug, dl) in parsed]
+    else:
+        # one button per city = its NEAREST upcoming market (today if live)
+        by_city = {}
+        for d, city, slug, dl in parsed:
+            if city not in by_city:           # parsed is date-sorted → earliest wins
+                by_city[city] = (slug, city, dl)
+        rows = sorted(by_city.values(), key=lambda r: r[1])
+
+    rows = rows[:60]
     markets_cache[str(chat)] = rows
     kb, row = [], []
-    for i, (slug, city, date) in enumerate(rows):
-        row.append({"text": f"{city} · {date}", "callback_data": f"m|{i}"})
+    for i, (slug, city, date_label) in enumerate(rows):
+        tag = " (today)" if _slug_date(slug) == today else ""
+        row.append({"text": f"{city} · {date_label}{tag}", "callback_data": f"m|{i}"})
         if len(row) == 2:
             kb.append(row); row = []
     if row:
         kb.append(row)
     send_message(chat,
         f"🌡️ <b>{len(rows)} live temperature markets</b>"
-        + (f" matching '{city_filter}'" if city_filter else "")
+        + (f" for '{city_filter}'" if city_filter else " (nearest day per city)")
         + "\nTap one to get its buy card:", kb)
 
 # ===================== BUY EXECUTION =====================
