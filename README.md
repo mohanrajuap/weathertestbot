@@ -127,9 +127,27 @@ they see the same file (a **Volume** mounted at `/data`).
 
 ---
 
+## Testing the Telegram flow (`/test`)
+
+You don't need the forecast bot to rehearse buying. Message the trader:
+
+```
+/test                                                  # uses TEST_EVENT_SLUG / default
+/test highest-temperature-in-london-on-june-24-2026    # any live event slug
+```
+
+It pulls the **live** buckets/prices/tokens for that event and sends you a
+real buy card (model% shows `?` since there's no forecast behind a manual
+test). Tap a bucket → unit → amount → Confirm to place a **real** order
+(keep amounts tiny; Polymarket's min is ~$1 notional). Then it watches
+TP/SL and asks before selling, exactly as in production.
+
+> Find a live slug from any `polymarket.com/event/<slug>` temperature page,
+> or set `TEST_EVENT_SLUG` so bare `/test` always works.
+
 ## Commands & safety
 
-- Telegram: `/positions` (list open trades), `/help`.
+- Telegram: `/test [slug]` (rehearse a buy), `/positions` (list open trades), `/help`.
 - Only `TELEGRAM_CHAT_ID`(s) can press buttons; others are ignored.
 - `trader_state.json` persists open positions + handled signals across
   restarts — keep it on the Railway volume.

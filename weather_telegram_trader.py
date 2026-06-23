@@ -58,6 +58,11 @@ MONITOR_POLL_S  = float(os.getenv("MONITOR_POLL_S", "5"))
 FILL_TIMEOUT_S  = int(os.getenv("FILL_TIMEOUT_S", "45"))
 MAX_HOLD_HOURS  = float(os.getenv("MAX_HOLD_HOURS", "30"))
 
+# /test with no slug uses this (override with TEST_EVENT_SLUG). Update the
+# date to a currently-live event, or always pass a slug: /test <slug>.
+DEFAULT_TEST_SLUG = os.getenv("TEST_EVENT_SLUG",
+                             "highest-temperature-in-london-on-june-24-2026")
+
 API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # ===================== LOGGING =====================
@@ -281,6 +286,48 @@ def handle_new_signal(sig):
     save_state()
     logger.info(f"📨 Sent trade card {sid} for {sid_key} ({len(cands)} candidates)")
 
+def build_test_signal(slug):
+    """Build a signal from a LIVE temperature event so you can rehearse
+    the whole Telegram → buy flow without the forecast bot. Pulls the
+    real buckets/prices/tokens off Gamma; model_prob is left unknown
+    (shown as '?') since there's no forecast behind a manual test."""
+    ev = pm.fetch_event(slug)
+    if not ev:
+        return None
+    cands = []
+    for m in ev.get("markets", []) or []:
+        if m.get("closed"):
+            continue
+        try:
+            pr = json.loads(m.get("outcomePrices") or "[]")
+            tk = json.loads(m.get("clobTokenIds") or "[]")
+        except Exception:
+            continue
+        if not pr or not tk:
+            continue
+        temp = pm.bucket_temp(m.get("groupItemTitle"))
+        cands.append({
+            "bucket": str(temp) if temp is not None else (m.get("groupItemTitle") or "?"),
+            "side": "YES", "model_prob": None,
+            "price": float(pr[0]), "token_id": tk[0], "is_best": False,
+        })
+    # favorites first (highest YES price), keep it to a tidy menu
+    cands.sort(key=lambda c: c["price"], reverse=True)
+    cands = cands[:5]
+    if not cands:
+        return None
+    cands[0]["is_best"] = True
+    try:
+        city = slug.split("-in-")[-1].split("-on-")[0]
+    except Exception:
+        city = "test"
+    return {
+        "signal_id": f"TEST|{slug}|{int(time.time())}",   # unique each /test
+        "event_slug": slug, "city": city, "target_date": "TEST",
+        "temp_unit": "°C", "tp_price": DEFAULT_TP_PRICE,
+        "sl_price": DEFAULT_SL_PRICE, "buy_now": True, "candidates": cands,
+    }
+
 # ===================== BUY EXECUTION =====================
 
 def _shares_for(candidate, unit, amount):
@@ -486,7 +533,22 @@ def handle_text(msg):
                 "🌡️ <b>Weather Trader</b>\nI send a card when your forecast bot "
                 "finds a trade. Tap positions, set unit + amount, Confirm. "
                 "I ask before every sell.\n\n"
+                "/test [event-slug] — send a card from a LIVE market to rehearse\n"
                 "/positions — list open trades\n/help — this message")
+        elif cmd == "/test":
+            parts = text.split()
+            slug = parts[1] if len(parts) > 1 else os.getenv("TEST_EVENT_SLUG", DEFAULT_TEST_SLUG)
+            send_message(chat, f"🧪 Building a test card from <code>{slug}</code> …")
+            try:
+                sig = build_test_signal(slug)
+            except Exception as e:
+                sig = None
+                logger.warning(f"/test build failed: {e}")
+            if not sig or not sig.get("candidates"):
+                send_message(chat, f"⚠️ No tradeable buckets found for <code>{slug}</code>. "
+                                   f"Pass a live event slug: <code>/test highest-temperature-in-london-on-june-24-2026</code>")
+            else:
+                handle_new_signal(sig)
         elif cmd == "/positions":
             opens = [p for p in positions.values() if p["status"] == "open"]
             if not opens:
