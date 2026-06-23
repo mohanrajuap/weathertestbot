@@ -11,6 +11,7 @@
 import os
 import re
 import json
+import time
 import logging
 from datetime import datetime
 
@@ -152,33 +153,28 @@ def _safe_clob_tokens(market):
             logger.error(f"❌ token parse failed: {e}")
     return None, None
 
-def fetch_event(event_slug):
-    try:
-        r = requests.get(f"{GAMMA}/events", params={"slug": event_slug},
-                         timeout=HTTP_TIMEOUT_S)
-        events = r.json()
-        if isinstance(events, list) and events:
-            return events[0]
-    except Exception as e:
-        logger.error(f"❌ event fetch failed for {event_slug}: {e}")
-    return None
+def _gamma_get(params, retries=3):
+    """GET /events with retries — the Gamma API throws intermittent
+    ConnectionErrors, so a single attempt loses real data."""
+    for _ in range(retries):
+        try:
+            r = requests.get(f"{GAMMA}/events", params=params, timeout=HTTP_TIMEOUT_S + 5)
+            d = r.json()
+            if isinstance(d, list):
+                return d
+        except Exception:
+            time.sleep(0.6)
+    return []
 
-def list_temperature_events(limit=300):
+def fetch_event(event_slug):
+    d = _gamma_get({"slug": event_slug})
+    return d[0] if d else None
+
+def list_temperature_events(limit=500):
     """All LIVE 'Highest temperature in <city> on <date>' events across every
     city, via the 'highest-temperature' tag. Returns the raw event list."""
-    try:
-        r = requests.get(
-            f"{GAMMA}/events",
-            params={"active": "true", "closed": "false",
-                    "tag_slug": "highest-temperature", "limit": limit,
-                    "order": "startDate", "ascending": "false"},
-            timeout=HTTP_TIMEOUT_S + 5,
-        )
-        d = r.json()
-        return d if isinstance(d, list) else []
-    except Exception as e:
-        logger.error(f"❌ temperature events fetch failed: {e}")
-        return []
+    return _gamma_get({"active": "true", "closed": "false",
+                       "tag_slug": "highest-temperature", "limit": limit})
 
 def resolve_token(event_slug, bucket, side):
     """(token_id, market) for the sub-market matching `bucket`, on the

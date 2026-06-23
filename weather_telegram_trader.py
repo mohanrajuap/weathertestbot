@@ -399,42 +399,56 @@ def build_test_signal(slug):
 # ── live-markets browser ──
 markets_cache = {}   # chat_id -> [(slug, city, date), …]
 
+_CITY_SLUG_MAP = {"new york": "nyc", "newyork": "nyc"}
+
+def _city_to_slug(city_filter):
+    c = city_filter.strip().lower()
+    c = _CITY_SLUG_MAP.get(c, c)
+    return c.replace(" ", "-")
+
 def _send_markets_menu(chat, city_filter=None):
-    from datetime import date as _date
+    from datetime import date as _date, timedelta
     send_message(chat, "🔎 Scanning live temperature markets …")
-    events = pm.list_temperature_events()
     today = _date.today()
+    rows = []
 
-    parsed, seen = [], set()
-    for e in events:
-        slug = e.get("slug") or ""
-        if not _is_highest_temp_slug(slug) or slug in seen:
-            continue
-        d = _slug_date(slug)
-        if d is None or d < today:           # drop already-passed days
-            continue
-        city, date_label = _parse_temp_slug(slug)
-        if city_filter and city_filter not in city.lower():
-            continue
-        seen.add(slug)
-        parsed.append((d, city, slug, date_label))
+    if city_filter:
+        # RELIABLE per-city path: build this city's slugs for today..+5 days
+        # and fetch each directly (the tag list is capped ~100 and can drop
+        # today's market). fetch_event retries the flaky Gamma API.
+        cslug = _city_to_slug(city_filter)
+        for n in range(0, 6):
+            d = today + timedelta(days=n)
+            slug = f"highest-temperature-in-{cslug}-on-{_MONTH_NAMES[d.month-1]}-{d.day}-{d.year}"
+            ev = pm.fetch_event(slug)
+            if not ev or ev.get("closed") or not ev.get("active"):
+                continue
+            city, date_label = _parse_temp_slug(slug)
+            rows.append((slug, city, date_label))
+    else:
+        # overview: one button per city = its nearest upcoming day
+        parsed, seen = [], set()
+        for e in pm.list_temperature_events():
+            slug = e.get("slug") or ""
+            if not _is_highest_temp_slug(slug) or slug in seen:
+                continue
+            d = _slug_date(slug)
+            if d is None or d < today:
+                continue
+            city, date_label = _parse_temp_slug(slug)
+            seen.add(slug)
+            parsed.append((d, city, slug, date_label))
+        parsed.sort(key=lambda x: (x[0], x[1]))
+        by_city = {}
+        for d, city, slug, dl in parsed:
+            if city not in by_city:
+                by_city[city] = (slug, city, dl)
+        rows = sorted(by_city.values(), key=lambda r: r[1])
 
-    if not parsed:
+    if not rows:
         send_message(chat, "No live temperature markets found"
                      + (f" for '{city_filter}'." if city_filter else "."))
         return
-
-    parsed.sort(key=lambda x: (x[0], x[1]))   # soonest date first, then city
-    if city_filter:
-        # show every upcoming date for that city (today first)
-        rows = [(slug, city, dl) for (d, city, slug, dl) in parsed]
-    else:
-        # one button per city = its NEAREST upcoming market (today if live)
-        by_city = {}
-        for d, city, slug, dl in parsed:
-            if city not in by_city:           # parsed is date-sorted → earliest wins
-                by_city[city] = (slug, city, dl)
-        rows = sorted(by_city.values(), key=lambda r: r[1])
 
     rows = rows[:60]
     markets_cache[str(chat)] = rows
