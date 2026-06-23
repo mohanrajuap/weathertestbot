@@ -287,6 +287,13 @@ def handle_new_signal(sig):
     save_state()
     logger.info(f"📨 Sent trade card {sid} for {sid_key} ({len(cands)} candidates)")
 
+# Only ever touch "Highest temperature in <city>" markets — never the
+# city's lowest-temperature or precipitation/rain events.
+HIGHEST_TEMP_PREFIX = "highest-temperature-in-"
+
+def _is_highest_temp_slug(slug):
+    return bool(slug) and str(slug).startswith(HIGHEST_TEMP_PREFIX)
+
 def _parse_temp_slug(slug):
     """'highest-temperature-in-mexico-city-on-june-24-2026' →
     ('Mexico City', 'June 24 2026')."""
@@ -301,6 +308,11 @@ def build_test_signal(slug):
     """Build a signal from a LIVE temperature event so you can buy from any
     market without the forecast bot. Pulls the real buckets/prices/tokens off
     Gamma; model_prob is unknown (shown as '?') since there's no forecast."""
+    # Guard: only "Highest temperature in …" markets — refuse lowest-temp,
+    # precipitation, or any other weather event even if asked directly.
+    if not _is_highest_temp_slug(slug):
+        logger.warning(f"refusing non-highest-temperature slug: {slug}")
+        return None
     ev = pm.fetch_event(slug)
     if not ev:
         return None
@@ -344,7 +356,8 @@ def _send_markets_menu(chat, city_filter=None):
     rows, seen = [], set()
     for e in events:
         slug = e.get("slug") or ""
-        if not slug or slug in seen:
+        # double safety on top of the tag filter: highest-temperature only
+        if not _is_highest_temp_slug(slug) or slug in seen:
             continue
         city, date = _parse_temp_slug(slug)
         if city_filter and city_filter not in city.lower():
