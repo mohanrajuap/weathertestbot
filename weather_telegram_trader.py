@@ -493,18 +493,25 @@ def _send_markets_menu(chat, city_filter=None):
 # ===================== BUY EXECUTION =====================
 
 def _shares_for(unit, amount, ask):
-    """WHOLE share count for one position (no fractional fills). Buying is
-    share-based; we place a marketable LIMIT order for this many shares.
-    Honors your input but never below Polymarket's minimums — at least
-    MIN_SHARES (5) AND enough shares that shares×price ≥ MIN_ORDER_USD ($1).
+    """WHOLE share count for one position (no fractional fills).
+
+    SHARES mode honors EXACTLY what you typed (only floored at the 5-share
+    exchange minimum) — it never silently inflates your count to hit the $1
+    notional. If your shares are worth < $1 the caller rejects the order with
+    a clear message instead of buying 100× more than you asked.
+
+    USD mode converts $ → whole shares and DOES meet both minimums (that's
+    the point of choosing USD).
+
     Returns (shares, bumped_bool)."""
     price = ask if (ask and ask > 0) else 0.5
     if unit == "SHARES":
         want = int(round(float(amount)))
-        shares = max(MIN_SHARES, want)
-    else:  # USD → whole shares
-        want = max(1, int(float(amount) // price))
-        shares = max(MIN_SHARES, math.ceil(max(float(amount), MIN_ORDER_USD) / price))
+        shares = max(MIN_SHARES, want)          # honor count; no $1 inflation
+        return shares, (shares > want)
+    # USD → whole shares, meeting both minimums
+    want = max(1, int(float(amount) // price))
+    shares = max(MIN_SHARES, math.ceil(max(float(amount), MIN_ORDER_USD) / price))
     while shares * price < MIN_ORDER_USD - 1e-6:
         shares += 1
     return shares, (shares > want)
@@ -522,6 +529,13 @@ def _buy_one(slug, bucket, side, city, target_date, unit_sym, amount, unit,
     if ask is None:
         return None, f"❌ {bucket}{unit_sym}: no live price"
     shares, bumped = _shares_for(unit, amount, ask)
+    # Don't silently 100× a share order to hit the $1 minimum — reject and
+    # tell the user the real minimum for this (often very cheap) bucket.
+    if shares * ask < MIN_ORDER_USD - 1e-6:
+        need = math.ceil(MIN_ORDER_USD / ask)
+        return None, (f"❌ {bucket}{unit_sym}: {shares} sh = ${shares*ask:.2f}, below "
+                      f"Polymarket's $1 min. Need ~{need} sh at {_fmt_cents(ask)} "
+                      f"— increase shares, or use 💵 USD mode.")
     max_price = round(ask + 0.05, 3)
     oid, limit = pm.place_buy(token, ask, max_price, shares)
     if not oid:

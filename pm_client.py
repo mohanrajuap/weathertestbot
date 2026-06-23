@@ -230,7 +230,10 @@ def place_buy(token_id, ask, max_price, shares):
     if ask > cap:
         logger.warning(f"⚠️ ask {ask:.3f} > cap {cap:.3f} — skip buy")
         return None, None
-    limit = min(round(ask + ENTRY_BUFFER, 3), cap)
+    # Cap the cross buffer at the ask itself so a sub-cent price isn't
+    # inflated (ask 0.002 + 0.01 = 0.012 reserved 6× the real cost).
+    buffer = min(ENTRY_BUFFER, max(ask, 0.001))
+    limit = min(round(ask + buffer, 3), cap)
     logger.info(f"🎯 BUY limit {limit:.3f} x {shares}")
     if DRY_RUN:
         logger.info("🧪 DRY_RUN — buy not sent")
