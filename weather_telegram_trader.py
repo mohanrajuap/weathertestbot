@@ -52,8 +52,9 @@ DEFAULT_SL_PRICE = float(os.getenv("SL_PRICE", "0.20"))
 
 USD_PRESETS    = [float(x) for x in os.getenv("USD_PRESETS", "1,5,10,25,50").split(",")]
 SHARE_PRESETS  = [int(float(x)) for x in os.getenv("SHARE_PRESETS", "5,10,25,50").split(",")]
-# Polymarket rejects marketable orders below ~$1 notional; size up to clear it.
+# Polymarket rejects orders below BOTH a ~$1 notional AND a 5-share minimum.
 MIN_ORDER_USD  = float(os.getenv("MIN_ORDER_USD", "1.0"))
+MIN_SHARES     = int(os.getenv("MIN_SHARES", "5"))
 DEFAULT_UNIT   = os.getenv("DEFAULT_UNIT", "USD").strip().upper()  # USD | SHARES
 
 SIGNAL_POLL_S   = float(os.getenv("SIGNAL_POLL_S", "5"))
@@ -333,27 +334,15 @@ def build_test_signal(slug):
 
 # ===================== BUY EXECUTION =====================
 
-def _shares_for(candidate, unit, amount):
-    """Resolve the order size in shares for one position, guaranteeing the
-    notional clears Polymarket's marketable-order minimum (~$1). Polymarket
-    computes that minimum on the BEST ASK (its 400 showed 2×$0.36=$0.72), so
-    we size on the ask too and round UP."""
-    token = candidate.get("token_id")
-    ask = pm.best_ask(token) if token else None
-    price = ask or candidate.get("price") or 0.5
-    if price <= 0:
-        price = 0.5
-
-    if unit == "SHARES":
-        shares = max(1, int(round(amount)))
-    else:  # USD → shares; never below the $1 min notional
-        target = max(float(amount), MIN_ORDER_USD)
-        shares = max(1, math.ceil(target / price))
-
-    # precision-safe guarantee that shares*price >= the exchange minimum
-    while shares * price < MIN_ORDER_USD - 1e-6:
-        shares += 1
-    return shares
+def _dollars_for(unit, amount, ask):
+    """Dollar amount to spend on a MARKET buy for one position, honoring
+    your input but never below Polymarket's minimums (≥ $MIN_ORDER_USD AND
+    ≥ MIN_SHARES at the live ask). Returns (dollars, bumped_bool)."""
+    price = ask if (ask and ask > 0) else 0.5
+    want = float(amount) if unit == "USD" else float(amount) * price  # SHARES→$
+    floor = max(MIN_ORDER_USD, MIN_SHARES * price)
+    dollars = round(max(want, floor) + 1e-9, 2)
+    return dollars, (dollars > want + 0.01)
 
 def execute_buys(sess, cb_chat):
     if not sess["selected"]:
@@ -379,24 +368,27 @@ def execute_buys(sess, cb_chat):
             if not token:
                 results.append(f"❌ {bucket}{sess['unit_sym']}: could not resolve token")
                 continue
-            shares = _shares_for(c, sess["unit"], sess["amount"])
             ask = pm.best_ask(token)
             if ask is None:
                 results.append(f"❌ {bucket}{sess['unit_sym']}: no live price")
                 continue
-            max_price = round(ask + 0.05, 3)  # small slippage allowance
-            oid, limit = pm.place_buy(token, ask, max_price, shares)
+            dollars, bumped = _dollars_for(sess["unit"], sess["amount"], ask)
+
+            oid, spent = pm.place_market_buy(token, dollars)
             if not oid:
                 results.append(f"❌ {bucket}{sess['unit_sym']}: order rejected")
                 continue
 
-            # confirm fill
+            # confirm fill (FOK fills fully or kills)
             filled = _await_fill(oid)
             if filled == 0:
-                pm.cancel_order(oid)
-                results.append(f"⚠️ {bucket}{sess['unit_sym']}: not filled, cancelled")
+                results.append(f"⚠️ {bucket}{sess['unit_sym']}: not filled (killed)")
                 continue
-            held = shares if filled < 0 else int(filled)  # <0 = dry-run sentinel
+            held = int(round(dollars / ask)) if filled < 0 else int(filled)  # <0=dry-run
+            if held <= 0:
+                results.append(f"⚠️ {bucket}{sess['unit_sym']}: 0 shares filled")
+                continue
+            entry = round(dollars / held, 3)
 
             pid = _next_pid()
             end_ts = pm.market_end_ts(market) or (time.time() + MAX_HOLD_HOURS * 3600)
@@ -404,14 +396,15 @@ def execute_buys(sess, cb_chat):
                 "pid": pid, "token_id": token, "bucket": bucket, "side": side,
                 "city": sess["city"], "target_date": sess["target_date"],
                 "event_slug": sess["event_slug"], "unit_sym": sess["unit_sym"],
-                "shares": held, "entry_price": limit,
+                "shares": held, "entry_price": entry,
                 "tp_price": sess["tp_price"], "sl_price": sess["sl_price"],
                 "end_ts": end_ts, "tp_done": False, "sl_done": False,
                 "status": "open", "chat_id": sess["chat_id"],
             }
+            note = (f" — bumped to {MIN_SHARES}-share/$1 min" if bumped else "")
             results.append(
-                f"✅ {bucket}{sess['unit_sym']}: bought {held} sh @ ~{limit:.2f} "
-                f"(~${held * (ask or limit):.2f}, pid {pid})"
+                f"✅ {bucket}{sess['unit_sym']}: market-bought ~{held} sh "
+                f"for ~${dollars:.2f}{note} (pid {pid})"
             )
             save_state()
 

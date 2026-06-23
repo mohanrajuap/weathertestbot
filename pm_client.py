@@ -21,6 +21,7 @@ from eth_account import Account
 from py_clob_client_v2.client import ClobClient
 from py_clob_client_v2.clob_types import (
     OrderArgs,
+    MarketOrderArgs,
     OrderType,
     BalanceAllowanceParams,
     AssetType,
@@ -222,6 +223,25 @@ def place_buy(token_id, ask, max_price, shares):
         return (resp.get("orderID") or resp.get("id")), limit
     except Exception as e:
         logger.error(f"❌ buy failed: {e}")
+        return None, None
+
+def place_market_buy(token_id, dollars):
+    """True MARKET buy (FOK) for `dollars` of USDC — the SDK fills as many
+    shares as $dollars buys at the live book, or kills the order. Returns
+    (order_id, dollars) or (None, None). For BUY, MarketOrderArgs.amount is
+    the $ amount, not a share count."""
+    dollars = round(float(dollars), 2)
+    logger.info(f"🎯 MARKET BUY ${dollars} of {token_id[:14]}…")
+    if DRY_RUN:
+        logger.info("🧪 DRY_RUN — market buy not sent")
+        return "DRYRUN-BUY", dollars
+    try:
+        args = MarketOrderArgs(token_id=token_id, amount=dollars, side=BUY)
+        resp = get_client().create_and_post_market_order(args, order_type=OrderType.FOK)
+        logger.info(f"✅ MARKET BUY resp: {resp}")
+        return (resp.get("orderID") or resp.get("id")), dollars
+    except Exception as e:
+        logger.error(f"❌ market buy failed: {e}")
         return None, None
 
 def place_sell(token_id, price, shares, label="SELL"):
