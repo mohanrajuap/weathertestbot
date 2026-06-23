@@ -27,6 +27,7 @@ import time
 import logging
 import threading
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 from dotenv import load_dotenv
@@ -50,18 +51,19 @@ STATE_FILE   = os.getenv("STATE_FILE", "trader_state.json")
 DEFAULT_TP_PRICE = float(os.getenv("TP_PRICE", "0.90"))
 DEFAULT_SL_PRICE = float(os.getenv("SL_PRICE", "0.20"))
 
-USD_PRESETS    = [float(x) for x in os.getenv("USD_PRESETS", "1,5,10,25,50").split(",")]
-SHARE_PRESETS  = [int(float(x)) for x in os.getenv("SHARE_PRESETS", "5,10,25,50").split(",")]
-# Always keep the $1 / 5-share minimum as a one-tap option even if an old
-# env var omits it.
-if 1.0 not in USD_PRESETS:
-    USD_PRESETS = [1.0] + USD_PRESETS
-if 5 not in SHARE_PRESETS:
-    SHARE_PRESETS = [5] + SHARE_PRESETS
+# Hardcoded so NO Railway variable is needed (and stale ones can't break it).
+USD_PRESETS    = [1.0, 5.0, 10.0, 25.0, 50.0]
+SHARE_PRESETS  = [5, 10, 25, 50]
+DEFAULT_UNIT   = "SHARES"
 # Polymarket rejects orders below BOTH a ~$1 notional AND a 5-share minimum.
-MIN_ORDER_USD  = float(os.getenv("MIN_ORDER_USD", "1.0"))
-MIN_SHARES     = int(os.getenv("MIN_SHARES", "5"))
-DEFAULT_UNIT   = os.getenv("DEFAULT_UNIT", "SHARES").strip().upper()  # SHARES | USD
+MIN_ORDER_USD  = 1.0
+MIN_SHARES     = 5
+
+# ── Webhook receiver (your signal bot POSTs here) ──
+WEBHOOK_PATH     = os.getenv("WEBHOOK_PATH", "/api/signal")
+WEBHOOK_TOKEN    = os.getenv("WEBHOOK_TOKEN", "").strip()   # optional Bearer secret
+WEBHOOK_PORT     = int(os.getenv("PORT", os.getenv("WEBHOOK_PORT", "8080")))
+QUICK_BUY_SHARES = int(os.getenv("QUICK_BUY_SHARES", "5"))  # one-tap default size
 
 SIGNAL_POLL_S   = float(os.getenv("SIGNAL_POLL_S", "5"))
 MONITOR_POLL_S  = float(os.getenv("MONITOR_POLL_S", "5"))
@@ -326,9 +328,9 @@ HIGHEST_TEMP_PREFIX = "highest-temperature-in-"
 def _is_highest_temp_slug(slug):
     return bool(slug) and str(slug).startswith(HIGHEST_TEMP_PREFIX)
 
-_MONTHS = {m.lower(): i for i, m in enumerate(
-    ["January", "February", "March", "April", "May", "June", "July",
-     "August", "September", "October", "November", "December"], start=1)}
+_MONTH_NAMES = ["january", "february", "march", "april", "may", "june", "july",
+                "august", "september", "october", "november", "december"]
+_MONTHS = {m: i for i, m in enumerate(_MONTH_NAMES, start=1)}
 
 def _parse_temp_slug(slug):
     """'highest-temperature-in-mexico-city-on-june-24-2026' →
@@ -468,6 +470,44 @@ def _shares_for(unit, amount, ask):
         shares += 1
     return shares, (shares > want)
 
+def _buy_one(slug, bucket, side, city, target_date, unit_sym, amount, unit,
+             tp_price, sl_price, chat, preset_token=None):
+    """Place ONE whole-share marketable limit buy and register it for TP/SL.
+    Returns (pid_or_None, result_line). Used by both the multi-select flow
+    and one-tap webhook buys so behavior is identical."""
+    rtoken, market = pm.resolve_token(slug, bucket, side)
+    token = preset_token or rtoken
+    if not token:
+        return None, f"❌ {bucket}{unit_sym}: could not resolve token"
+    ask = pm.best_ask(token)
+    if ask is None:
+        return None, f"❌ {bucket}{unit_sym}: no live price"
+    shares, bumped = _shares_for(unit, amount, ask)
+    max_price = round(ask + 0.05, 3)
+    oid, limit = pm.place_buy(token, ask, max_price, shares)
+    if not oid:
+        return None, f"❌ {bucket}{unit_sym}: order rejected"
+    filled = _await_fill(oid)
+    if filled == 0:
+        pm.cancel_order(oid)
+        return None, f"⚠️ {bucket}{unit_sym}: not filled, cancelled"
+    held = shares if filled < 0 else int(filled)
+    if held <= 0:
+        return None, f"⚠️ {bucket}{unit_sym}: 0 shares filled"
+    pid = _next_pid()
+    end_ts = pm.market_end_ts(market) or (time.time() + MAX_HOLD_HOURS * 3600)
+    positions[pid] = {
+        "pid": pid, "token_id": token, "bucket": bucket, "side": side,
+        "city": city, "target_date": target_date, "event_slug": slug,
+        "unit_sym": unit_sym, "shares": held, "entry_price": limit,
+        "tp_price": tp_price, "sl_price": sl_price, "end_ts": end_ts,
+        "tp_done": False, "sl_done": False, "status": "open", "chat_id": chat,
+    }
+    save_state()
+    note = (f" — min {MIN_SHARES}sh/$1" if bumped else "")
+    return pid, (f"✅ {bucket}{unit_sym}: bought {held} sh @ ~{limit:.2f} "
+                 f"(~${held * limit:.2f}{note}, pid {pid})")
+
 def execute_buys(sess, cb_chat):
     if not sess["selected"]:
         send_message(cb_chat, "⚠️ No position selected — tap a bucket first.")
@@ -484,54 +524,12 @@ def execute_buys(sess, cb_chat):
     with _order_lock:
         for i in sorted(sess["selected"]):
             c = sess["candidates"][i]
-            bucket = c["bucket"]
-            side = c.get("side", "YES")
-            # resolve token + market (for endDate); prefer the carried token
-            rtoken, market = pm.resolve_token(sess["event_slug"], bucket, side)
-            token = c.get("token_id") or rtoken
-            if not token:
-                results.append(f"❌ {bucket}{sess['unit_sym']}: could not resolve token")
-                continue
-            ask = pm.best_ask(token)
-            if ask is None:
-                results.append(f"❌ {bucket}{sess['unit_sym']}: no live price")
-                continue
-            shares, bumped = _shares_for(sess["unit"], sess["amount"], ask)
-            max_price = round(ask + 0.05, 3)  # marketable limit: cross to fill
-
-            oid, limit = pm.place_buy(token, ask, max_price, shares)
-            if not oid:
-                results.append(f"❌ {bucket}{sess['unit_sym']}: order rejected")
-                continue
-
-            # confirm fill
-            filled = _await_fill(oid)
-            if filled == 0:
-                pm.cancel_order(oid)
-                results.append(f"⚠️ {bucket}{sess['unit_sym']}: not filled, cancelled")
-                continue
-            held = shares if filled < 0 else int(filled)  # <0 = dry-run sentinel
-            if held <= 0:
-                results.append(f"⚠️ {bucket}{sess['unit_sym']}: 0 shares filled")
-                continue
-
-            pid = _next_pid()
-            end_ts = pm.market_end_ts(market) or (time.time() + MAX_HOLD_HOURS * 3600)
-            positions[pid] = {
-                "pid": pid, "token_id": token, "bucket": bucket, "side": side,
-                "city": sess["city"], "target_date": sess["target_date"],
-                "event_slug": sess["event_slug"], "unit_sym": sess["unit_sym"],
-                "shares": held, "entry_price": limit,
-                "tp_price": sess["tp_price"], "sl_price": sess["sl_price"],
-                "end_ts": end_ts, "tp_done": False, "sl_done": False,
-                "status": "open", "chat_id": sess["chat_id"],
-            }
-            note = (f" — min {MIN_SHARES}sh/$1" if bumped else "")
-            results.append(
-                f"✅ {bucket}{sess['unit_sym']}: bought {held} sh @ ~{limit:.2f} "
-                f"(~${held * limit:.2f}{note}, pid {pid})"
-            )
-            save_state()
+            _, line = _buy_one(
+                sess["event_slug"], c["bucket"], c.get("side", "YES"),
+                sess["city"], sess["target_date"], sess["unit_sym"],
+                sess["amount"], sess["unit"], sess["tp_price"], sess["sl_price"],
+                sess["chat_id"], preset_token=c.get("token_id"))
+            results.append(line)
 
     sess["status"] = "done"
     edit_message(sess["chat_id"], sess["message_id"],
@@ -575,6 +573,150 @@ def do_sell(pos, cb_chat=None):
            f"(entry {_fmt_cents(pos['entry_price'])})")
     send_message(cb_chat or pos["chat_id"], msg)
     logger.info(msg)
+
+# ===================== WEBHOOK SIGNALS (one-tap buy) =====================
+# Your forecast/signal bot POSTs a JSON payload here when it finds a trade.
+# We turn it into a Telegram card with ONE-TAP buy buttons for both the
+# bias and no-bias buckets.
+
+quick_sessions = {}          # qid -> {slug, bucket, side, city, date, unit_sym, price}
+_qid_counter = 0
+
+def _next_qid():
+    global _qid_counter
+    _qid_counter += 1
+    return "q" + format(_qid_counter, "x")
+
+def _signal_slug(payload):
+    """Event slug from the payload's market.url, else built from city+date."""
+    m = payload.get("market") or {}
+    url = m.get("url") or ""
+    if "/event/" in url:
+        return url.split("/event/")[-1].strip("/")
+    city = (payload.get("city") or "").lower().replace(" ", "-")
+    td = payload.get("target_date") or ""        # "2026-06-22"
+    try:
+        y, mo, d = td.split("-")
+        return f"highest-temperature-in-{city}-on-{_MONTH_NAMES[int(mo)-1]}-{int(d)}-{y}"
+    except Exception:
+        return None
+
+def _bucket_from(val):
+    try:
+        return int(round(float(val)))
+    except Exception:
+        return None
+
+def handle_webhook_signal(payload):
+    """Build and send the one-tap buy card from a signal payload."""
+    if not PRIMARY_CHAT:
+        return
+    slug = _signal_slug(payload)
+    if not slug or not _is_highest_temp_slug(slug):
+        logger.warning(f"webhook: non-highest-temperature or unresolved slug: {slug}")
+        return
+
+    city = payload.get("city") or "?"
+    td   = payload.get("target_date") or "—"
+    usym = payload.get("unit") or "°C"
+    blend = payload.get("blend") or {}
+    best  = payload.get("best_trade") or {}
+    market = payload.get("market") or {}
+    prices = market.get("prices") or {}
+
+    with_bias = blend.get("with_bias")
+    no_bias   = blend.get("no_bias")
+    bias_b   = _bucket_from(with_bias)
+    nobias_b = _bucket_from(no_bias)
+    best_b   = best.get("bucket")
+
+    def price_of(b):
+        if b is None:
+            return None
+        v = prices.get(str(b))
+        try:
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
+    # de-duplicate the one-tap options (bias / no-bias / best)
+    options, seen = [], set()
+    for label, b in (("bias", bias_b), ("no-bias", nobias_b), ("best", best_b)):
+        if b is None or b in seen:
+            if b is not None:
+                # merge label into the existing option for that bucket
+                for o in options:
+                    if o["bucket"] == b and label not in o["labels"]:
+                        o["labels"].append(label)
+            continue
+        seen.add(b)
+        options.append({"bucket": b, "labels": [label], "price": price_of(b)})
+
+    if not options:
+        logger.warning("webhook: no buckets to offer")
+        return
+
+    # header
+    edge = best.get("edge")
+    edge_s = f" · edge +{edge*100:.0f}%" if isinstance(edge, (int, float)) else ""
+    lines = [
+        f"🚨 <b>Signal — {city.title()} ({td})</b>",
+        f"{payload.get('verdict','?')} · {payload.get('timing','?')}{edge_s}",
+    ]
+    if isinstance(with_bias, (int, float)):
+        lines.append(f"🧬 bias <b>{with_bias:.1f}{usym}</b> → bucket {bias_b}")
+    if isinstance(no_bias, (int, float)):
+        lines.append(f"📊 no-bias <b>{no_bias:.1f}{usym}</b> → bucket {nobias_b}")
+    if best.get("action"):
+        lines.append(f"⭐ {best.get('action')} {best_b}{usym} @ "
+                     f"{_fmt_cents(best.get('yes_price'))}")
+
+    # one-tap buttons (+ the multi-option card + dismiss)
+    kb = []
+    for o in options:
+        qid = _next_qid()
+        quick_sessions[qid] = {
+            "slug": slug, "bucket": str(o["bucket"]), "side": "YES",
+            "city": city, "target_date": td, "unit_sym": usym,
+        }
+        lab = "+".join(o["labels"])
+        pc = f" @ {_fmt_cents(o['price'])}" if o["price"] is not None else ""
+        kb.append([{
+            "text": f"⚡ Buy {o['bucket']}{usym} ({lab}) · {QUICK_BUY_SHARES}sh{pc}",
+            "callback_data": f"q|{qid}",
+        }])
+    # build a full card (all buckets) for amount selection
+    sig = build_test_signal(slug)
+    if sig and sig.get("candidates"):
+        gid = _next_qid()
+        quick_sessions[gid] = {"full_slug": slug}
+        kb.append([{"text": "🎛 Choose amount / more buckets", "callback_data": f"q|{gid}"}])
+
+    send_message(PRIMARY_CHAT, "\n".join(lines)
+                 + f"\n\n<i>One-tap buys {QUICK_BUY_SHARES} shares (min $1/5sh enforced).</i>", kb)
+    logger.info(f"📨 Webhook signal card sent for {slug}: buckets {[o['bucket'] for o in options]}")
+
+def do_quick_buy(qid, chat):
+    qs = quick_sessions.get(qid)
+    if not qs:
+        send_message(chat, "This signal expired — send the signal again.")
+        return
+    if qs.get("full_slug"):                       # "choose amount" → full card
+        sig = build_test_signal(qs["full_slug"])
+        if sig and sig.get("candidates"):
+            handle_new_signal(sig)
+        else:
+            send_message(chat, "⚠️ Could not load the market.")
+        return
+    send_message(chat, f"⚡ Buying {QUICK_BUY_SHARES} sh {qs['bucket']}{qs['unit_sym']} "
+                       f"{qs['city'].title()} …")
+    with _order_lock:
+        pid, line = _buy_one(
+            qs["slug"], qs["bucket"], qs["side"], qs["city"], qs["target_date"],
+            qs["unit_sym"], QUICK_BUY_SHARES, "SHARES",
+            DEFAULT_TP_PRICE, DEFAULT_SL_PRICE, chat)
+    send_message(chat, line)
+    logger.info(f"⚡ one-tap buy: {line}")
 
 # ===================== CALLBACK HANDLING =====================
 
@@ -675,6 +817,13 @@ def handle_callback(cb):
         threading.Thread(target=_open, daemon=True).start()
         return
 
+    # ── one-tap webhook buy ──
+    if kind == "q" and len(parts) >= 2:
+        qid = parts[1]
+        answer_callback(cb_id, "On it…")
+        threading.Thread(target=do_quick_buy, args=(qid, chat), daemon=True).start()
+        return
+
     answer_callback(cb_id)
 
 def handle_text(msg):
@@ -742,6 +891,61 @@ def handle_text(msg):
                 send_message(chat, "⚠️ Please reply with a positive number, e.g. 15")
         else:
             awaiting.pop(chat, None)
+
+# ===================== WEBHOOK HTTP SERVER =====================
+
+class _WebhookHandler(BaseHTTPRequestHandler):
+    def _send(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):                       # health check
+        self._send(200, {"ok": True, "service": "weather-trader"})
+
+    def do_POST(self):
+        # accept the configured path (and tolerate a trailing slash / root)
+        if WEBHOOK_PATH not in (self.path, self.path.rstrip("/")) and self.path != "/":
+            self._send(404, {"ok": False, "error": "not found"})
+            return
+        # optional bearer auth
+        if WEBHOOK_TOKEN:
+            auth = self.headers.get("Authorization", "")
+            if auth != f"Bearer {WEBHOOK_TOKEN}":
+                self._send(401, {"ok": False, "error": "unauthorized"})
+                return
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            payload = json.loads(self.rfile.read(n) or b"{}")
+        except Exception as e:
+            self._send(400, {"ok": False, "error": f"bad json: {e}"})
+            return
+        # a test ping (no city) just confirms connectivity
+        if not payload.get("city"):
+            self._send(200, {"ok": True, "pong": True})
+            return
+        try:
+            threading.Thread(target=handle_webhook_signal, args=(payload,),
+                             daemon=True).start()
+        except Exception as e:
+            logger.warning(f"webhook dispatch failed: {e}")
+        self._send(200, {"ok": True})
+
+    def log_message(self, *a):              # quiet the default stderr logging
+        return
+
+def webhook_loop():
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", WEBHOOK_PORT), _WebhookHandler)
+    except Exception as e:
+        logger.error(f"❌ webhook server failed to bind :{WEBHOOK_PORT}: {e}")
+        return
+    logger.info(f"🌐 Webhook server on :{WEBHOOK_PORT} path {WEBHOOK_PATH} "
+                f"(auth {'on' if WEBHOOK_TOKEN else 'off'})")
+    srv.serve_forever()
 
 # ===================== THREADS =====================
 
@@ -840,6 +1044,7 @@ def main():
     logger.info(f"   Signals file : {SIGNALS_FILE}")
     logger.info(f"   Chats        : {ALLOWED_CHATS}")
     logger.info(f"   Default unit : {DEFAULT_UNIT} | USD {USD_PRESETS} | Shares {SHARE_PRESETS}")
+    logger.info(f"   Webhook      : :{WEBHOOK_PORT}{WEBHOOK_PATH} | one-tap {QUICK_BUY_SHARES} sh")
     logger.info(f"   DRY_RUN      : {pm.DRY_RUN}")
     logger.info("=" * 70)
     load_state()
@@ -855,6 +1060,7 @@ def main():
         threading.Thread(target=telegram_loop, daemon=True),
         threading.Thread(target=signal_loop, daemon=True),
         threading.Thread(target=monitor_loop, daemon=True),
+        threading.Thread(target=webhook_loop, daemon=True),
     ]
     for t in threads:
         t.start()

@@ -167,6 +167,40 @@ Each bucket shows its upside if it wins (a YES share pays $1): e.g.
 computes the combined edge — buy 33°C @45¢ + 32°C @40¢ = **85¢/set → $1 if
 it lands in either → +15¢ (18%)**, "no loss if the high is in your range."
 
+## Signal-bot webhook → one-tap buy
+
+This bot runs a tiny HTTP server so your forecast/signal bot can push
+trades to it. On a new signal you get a Telegram card with **one-tap buy**
+buttons for **both** the bias and no-bias buckets.
+
+**Setup**
+1. Deploy this service on Railway and **Generate a Domain** (Settings →
+   Networking). It listens on Railway's `PORT` automatically.
+2. In your **signal bot**, set:
+   ```
+   WEBHOOK_URL=https://<this-trader-domain>/api/signal
+   WEBHOOK_TOKEN=<optional shared secret>
+   ```
+   (If you set a token, also set the same `WEBHOOK_TOKEN` here so it's verified.)
+3. Send `/webhook` in your signal bot to test — it expects a 2xx; this
+   trader returns `{"ok":true}` and a ping (payload without `city`) just
+   confirms connectivity.
+
+**What you get** — for a payload with `blend.with_bias` / `blend.no_bias`:
+```
+🚨 Signal — Istanbul (2026-06-22)
+TRADE · FIRMING · edge +61%
+🧬 bias 31.6°C → bucket 32
+📊 no-bias 31.1°C → bucket 31
+⭐ BUY YES 31°C @ 12¢
+[ ⚡ Buy 32°C (bias) · 5sh @ 22¢ ]
+[ ⚡ Buy 31°C (no-bias+best) · 5sh @ 12¢ ]
+[ 🎛 Choose amount / more buckets ]
+```
+One tap = a real share-based buy (5 shares default, $1/5-share min
+enforced), then it watches TP/SL and asks before selling. `QUICK_BUY_SHARES`
+sets the one-tap size.
+
 ## Commands & safety
 
 - Telegram: `/markets [city]` (browse all markets), `/test [slug]` (specific event), `/positions`, `/help`.
