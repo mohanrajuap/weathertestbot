@@ -101,16 +101,22 @@ def _parse_price(d):
         return float(d)
     return None
 
-def _price_http(token_id, side):
-    try:
-        r = PRICE_SESSION.get(
-            f"{HOST}/price",
-            params={"token_id": token_id, "side": side},
-            timeout=PRICE_TIMEOUT,
-        )
-        return _parse_price(r.json())
-    except Exception:
-        return None
+def _price_http(token_id, side, retries=3):
+    """best price via the public /price endpoint, retried — the CLOB host
+    throws intermittent connection errors, so one attempt loses the quote."""
+    for _ in range(retries):
+        try:
+            r = PRICE_SESSION.get(
+                f"{HOST}/price",
+                params={"token_id": token_id, "side": side},
+                timeout=PRICE_TIMEOUT,
+            )
+            p = _parse_price(r.json())
+            if p is not None:
+                return p
+        except Exception:
+            time.sleep(0.4)
+    return None
 
 def best_ask(token_id):
     p = _price_http(token_id, "BUY")

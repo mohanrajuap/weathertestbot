@@ -264,7 +264,10 @@ def render_keyboard(sess):
         mark = "● " if (s["amount"] == n) else ""
         row.append({"text": mark + label, "callback_data": f"b|{sid}|a|{n:g}"})
     kb.append(row)
-    kb.append([{"text": "✏️ Custom amount", "callback_data": f"b|{sid}|c"}])
+    kb.append([
+        {"text": "✏️ Custom amount", "callback_data": f"b|{sid}|c"},
+        {"text": "🔄 Refresh prices", "callback_data": f"b|{sid}|r"},
+    ])
     # confirm / cancel
     kb.append([
         {"text": "✅ Confirm Buy", "callback_data": f"b|{sid}|go"},
@@ -353,6 +356,25 @@ def _slug_date(slug):
     except Exception:
         return None
 
+def _apply_live_prices(cands):
+    """Overwrite each candidate's price with the LIVE best ask (what you'd
+    actually pay to buy YES) — Gamma's outcomePrices are a stale last/mid
+    snapshot. Fetched in parallel; keeps the snapshot if an ask is missing."""
+    threads = []
+    def fetch(c):
+        tok = c.get("token_id")
+        if not tok:
+            return
+        a = pm.best_ask(tok)
+        if a is not None:
+            c["price"] = a
+    for c in cands:
+        th = threading.Thread(target=fetch, args=(c,), daemon=True)
+        th.start()
+        threads.append(th)
+    for th in threads:
+        th.join(timeout=4)
+
 def build_test_signal(slug):
     """Build a signal from a LIVE temperature event so you can buy from any
     market without the forecast bot. Pulls the real buckets/prices/tokens off
@@ -382,11 +404,14 @@ def build_test_signal(slug):
             "side": "YES", "model_prob": None,
             "price": float(pr[0]), "token_id": tk[0], "is_best": False,
         })
-    # favorites first (highest YES price), keep it to a tidy menu
+    # favorites first (by gamma snapshot), keep a tidy menu, then overwrite
+    # with LIVE order-book asks so the card matches Polymarket's Buy price.
     cands.sort(key=lambda c: c["price"], reverse=True)
     cands = cands[:6]
     if not cands:
         return None
+    _apply_live_prices(cands)
+    cands.sort(key=lambda c: (c.get("price") or 0), reverse=True)
     cands[0]["is_best"] = True
     city, date = _parse_temp_slug(slug)
     return {
@@ -772,6 +797,12 @@ def handle_callback(cb):
             sess["amount"] = float(parts[3])
             answer_callback(cb_id, f"Amount set")
             push_card(sess)
+        elif act == "r":                     # refresh live prices
+            answer_callback(cb_id, "Refreshing…")
+            def _refresh():
+                _apply_live_prices(sess["candidates"])
+                push_card(sess)
+            threading.Thread(target=_refresh, daemon=True).start()
         elif act == "c":                     # custom amount
             awaiting[str(sess["chat_id"])] = sid
             answer_callback(cb_id)

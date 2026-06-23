@@ -161,6 +161,10 @@ shares, marketable limit orders — no fractional fills) and **nothing is
 pre-selected**: you only buy the bucket(s) you tap. Minimum order is 5
 shares AND ≥ $1, enforced automatically.
 
+Card prices are the **live order-book ask** (what you'd actually pay —
+matches Polymarket's "Buy Yes"), not a stale snapshot. Tap **🔄 Refresh
+prices** on any card to re-pull them before confirming.
+
 ### Edge calculator (on every card)
 Each bucket shows its upside if it wins (a YES share pays $1): e.g.
 `33°C · mkt 45¢ · win +55¢`. When you select multiple buckets the card
