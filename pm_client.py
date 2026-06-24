@@ -253,6 +253,22 @@ def market_end_ts(market):
     return None
 
 # ── orders ──
+def _post_with_retry(make_fn, retries=3):
+    """Retry order POSTs on Polymarket's transient 425 'order manager not
+    ready, please retry'. Re-raises any other error immediately."""
+    last = None
+    for _ in range(retries):
+        try:
+            return make_fn()
+        except Exception as e:
+            last = e
+            m = str(e).lower()
+            if "not ready" in m or "425" in m or "too early" in m:
+                time.sleep(1.0)
+                continue
+            raise
+    raise last
+
 def place_buy(token_id, ask, max_price, shares):
     """Marketable GTC buy capped at min(max_price, ENTRY_MAX).
     Returns (order_id, limit_price) or (None, None)."""
@@ -273,7 +289,7 @@ def place_buy(token_id, ask, max_price, shares):
         return "DRYRUN-BUY", limit
     try:
         args = OrderArgs(token_id=token_id, price=limit, size=shares, side=BUY)
-        resp = get_client().create_and_post_order(args, order_type=OrderType.GTC)
+        resp = _post_with_retry(lambda: get_client().create_and_post_order(args, order_type=OrderType.GTC))
         logger.info(f"✅ BUY resp: {resp}")
         return (resp.get("orderID") or resp.get("id")), limit
     except Exception as e:
@@ -292,7 +308,7 @@ def place_market_buy(token_id, dollars):
         return "DRYRUN-BUY", dollars
     try:
         args = MarketOrderArgs(token_id=token_id, amount=dollars, side=BUY)
-        resp = get_client().create_and_post_market_order(args, order_type=OrderType.FOK)
+        resp = _post_with_retry(lambda: get_client().create_and_post_market_order(args, order_type=OrderType.FOK))
         logger.info(f"✅ MARKET BUY resp: {resp}")
         return (resp.get("orderID") or resp.get("id")), dollars
     except Exception as e:
@@ -311,7 +327,7 @@ def place_limit_buy(token_id, price, shares):
         return "DRYRUN-BUY", px
     try:
         args = OrderArgs(token_id=token_id, price=px, size=shares, side=BUY)
-        resp = get_client().create_and_post_order(args, order_type=OrderType.GTC)
+        resp = _post_with_retry(lambda: get_client().create_and_post_order(args, order_type=OrderType.GTC))
         logger.info(f"✅ LIMIT BUY resp: {resp}")
         return (resp.get("orderID") or resp.get("id")), px
     except Exception as e:
