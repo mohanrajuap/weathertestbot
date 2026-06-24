@@ -188,6 +188,10 @@ def _fmt_pct(x):
 def _fmt_cents(x):
     return f"{x*100:.0f}¢" if isinstance(x, (int, float)) else "?"
 
+def _short_oid(oid):
+    o = str(oid or "")
+    return (o[:8] + "…" + o[-4:]) if len(o) > 14 else o
+
 def render_card(sess):
     s = sess
     unit = s["unit"]
@@ -530,45 +534,54 @@ def _buy_one(slug, bucket, side, city, target_date, unit_sym, amount, unit,
                   on the book (bypasses Polymarket's $1 marketable minimum).
 
     Returns (pid_or_None, result_line)."""
+    b = f"{bucket}{unit_sym}"
     rtoken, market = pm.resolve_token(slug, bucket, side)
     token = preset_token or rtoken
     if not token:
-        return None, f"❌ {bucket}{unit_sym}: could not resolve token"
+        return None, f"❌ <b>{b} failed</b>\n📡 could not resolve the market token"
     ask = pm.best_ask(token)
     if ask is None:
-        return None, f"❌ {bucket}{unit_sym}: no live price"
+        return None, f"❌ <b>{b} failed</b>\n📡 no live price right now — try Refresh"
 
     resting = False
     shares = 0
     dollars = 0.0
+    limit_px = ask
     if unit == "USD":
         dollars = round(max(float(amount), MIN_ORDER_USD), 2)   # $1 minimum
-        oid, _px = pm.place_market_buy(token, dollars)
+        oid, _px, info = pm.place_market_buy(token, dollars)
     else:  # SHARES → limit
         shares = max(MIN_SHARES, int(round(float(amount))))
         if shares * ask >= MIN_ORDER_USD - 1e-6:
-            oid, limit_px = pm.place_buy(token, ask, round(ask + 0.05, 3), shares)
+            oid, limit_px, info = pm.place_buy(token, ask, round(ask + 0.05, 3), shares)
         else:
-            oid, limit_px = pm.place_limit_buy(token, ask, shares)   # tiny longshot
+            oid, limit_px, info = pm.place_limit_buy(token, ask, shares)   # tiny longshot
             resting = True
 
     if not oid:
-        return None, f"❌ {bucket}{unit_sym}: order rejected"
+        return None, (f"❌ <b>{b} buy rejected</b>\n"
+                      f"📡 Polymarket: <i>{info.get('error', 'rejected')}</i>")
+
+    oid_s = _short_oid(oid)
+    status = str(info.get("status") or "").lower()
 
     filled = _await_fill(oid)
     if filled == 0:
         if resting:
-            return None, (f"📌 {bucket}{unit_sym}: limit {shares} sh @ {limit_px:.3f} "
-                          f"RESTING (fills when matched; no TP/SL until then)")
+            return None, (f"⏳ <b>{b} — limit placed, waiting to fill</b>\n"
+                          f"{shares} sh @ {_fmt_cents(limit_px)}\n"
+                          f"🆔 <code>{oid_s}</code> · 📡 Polymarket: <i>{status or 'live'}</i>\n"
+                          f"<i>Rests on the book; no TP/SL until it fills.</i>")
         pm.cancel_order(oid)
-        return None, f"⚠️ {bucket}{unit_sym}: not filled, cancelled"
+        return None, (f"⚠️ <b>{b} — not filled, cancelled</b>\n"
+                      f"🆔 <code>{oid_s}</code> · 📡 <i>{status or 'killed'}</i>")
 
     if filled < 0:                                   # DRY_RUN sentinel
         held = max(1, int(round(dollars / ask))) if unit == "USD" else shares
     else:
         held = int(filled)
     if held <= 0:
-        return None, f"⚠️ {bucket}{unit_sym}: 0 shares filled"
+        return None, f"⚠️ <b>{b}</b>: 0 shares filled (🆔 <code>{oid_s}</code>)"
 
     entry = round(dollars / held, 3) if unit == "USD" else round(limit_px, 3)
     pid = _next_pid()
@@ -581,9 +594,12 @@ def _buy_one(slug, bucket, side, city, target_date, unit_sym, amount, unit,
         "tp_done": False, "sl_done": False, "status": "open", "chat_id": chat,
     }
     save_state()
-    tag = "⚡" if unit == "USD" else "📊"
-    return pid, (f"✅ {tag} {bucket}{unit_sym}: {held} sh @ ~{entry:.2f} "
-                 f"(~${held * entry:.2f}, pid {pid})")
+    how = "⚡ market" if unit == "USD" else "📊 limit"
+    pm_status = "dry-run" if pm.DRY_RUN else (status or "matched")
+    return pid, (f"✅ <b>BOUGHT {held} × {b}</b> ({how})\n"
+                 f"avg ~{_fmt_cents(entry)} · spent ~${held * entry:.2f}\n"
+                 f"🆔 <code>{oid_s}</code> · 📡 Polymarket: <i>{pm_status} ✓</i>\n"
+                 f"👁 watching TP {_fmt_cents(tp_price)} / SL {_fmt_cents(sl_price)} · pid {pid}")
 
 def execute_buys(sess, cb_chat):
     if not sess["selected"]:

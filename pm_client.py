@@ -269,70 +269,67 @@ def _post_with_retry(make_fn, retries=3):
             raise
     raise last
 
+def _order_id(resp):
+    return resp.get("orderID") or resp.get("id")
+
+def _err_text(e):
+    """Pull Polymarket's human error out of a PolyApiException/exception."""
+    s = str(e)
+    m = re.search(r"error['\"]?\s*[:=]\s*['\"]?([^'\"}]+)", s)
+    return (m.group(1).strip() if m else s)[:200]
+
 def place_buy(token_id, ask, max_price, shares):
     """Marketable GTC buy capped at min(max_price, ENTRY_MAX).
-    Returns (order_id, limit_price) or (None, None)."""
+    Returns (order_id, limit_price, info) — info is the Polymarket response
+    dict on success or {"error": ...} on failure."""
     cap = min(max_price, ENTRY_MAX)
     if ask is None:
-        logger.warning("⚠️ no ask — skip buy")
-        return None, None
+        return None, None, {"error": "no ask price"}
     if ask > cap:
-        logger.warning(f"⚠️ ask {ask:.3f} > cap {cap:.3f} — skip buy")
-        return None, None
-    # Cap the cross buffer at the ask itself so a sub-cent price isn't
-    # inflated (ask 0.002 + 0.01 = 0.012 reserved 6× the real cost).
+        return None, None, {"error": f"ask {ask:.3f} > cap {cap:.3f}"}
     buffer = min(ENTRY_BUFFER, max(ask, 0.001))
     limit = min(round(ask + buffer, 3), cap)
     logger.info(f"🎯 BUY limit {limit:.3f} x {shares}")
     if DRY_RUN:
-        logger.info("🧪 DRY_RUN — buy not sent")
-        return "DRYRUN-BUY", limit
+        return "DRYRUN-BUY", limit, {"status": "dry_run", "success": True}
     try:
         args = OrderArgs(token_id=token_id, price=limit, size=shares, side=BUY)
         resp = _post_with_retry(lambda: get_client().create_and_post_order(args, order_type=OrderType.GTC))
         logger.info(f"✅ BUY resp: {resp}")
-        return (resp.get("orderID") or resp.get("id")), limit
+        return _order_id(resp), limit, resp
     except Exception as e:
         logger.error(f"❌ buy failed: {e}")
-        return None, None
+        return None, None, {"error": _err_text(e)}
 
 def place_market_buy(token_id, dollars):
-    """True MARKET buy (FOK) for `dollars` of USDC — the SDK fills as many
-    shares as $dollars buys at the live book, or kills the order. Returns
-    (order_id, dollars) or (None, None). For BUY, MarketOrderArgs.amount is
-    the $ amount, not a share count."""
+    """MARKET buy (FOK) for `dollars` of USDC. Returns (order_id, dollars, info)."""
     dollars = round(float(dollars), 2)
     logger.info(f"🎯 MARKET BUY ${dollars} of {token_id[:14]}…")
     if DRY_RUN:
-        logger.info("🧪 DRY_RUN — market buy not sent")
-        return "DRYRUN-BUY", dollars
+        return "DRYRUN-BUY", dollars, {"status": "dry_run", "success": True}
     try:
         args = MarketOrderArgs(token_id=token_id, amount=dollars, side=BUY)
         resp = _post_with_retry(lambda: get_client().create_and_post_market_order(args, order_type=OrderType.FOK))
         logger.info(f"✅ MARKET BUY resp: {resp}")
-        return (resp.get("orderID") or resp.get("id")), dollars
+        return _order_id(resp), dollars, resp
     except Exception as e:
         logger.error(f"❌ market buy failed: {e}")
-        return None, None
+        return None, None, {"error": _err_text(e)}
 
 def place_limit_buy(token_id, price, shares):
-    """GTC limit buy at EXACTLY `price` (no marketable buffer). Placed at the
-    touch it behaves like Polymarket's 'Limit' mode — it accepts small orders
-    (e.g. 5 shares @ 3¢) that a marketable buy would reject on the $1 min.
-    Returns (order_id, price) or (None, None)."""
+    """GTC limit buy at EXACTLY `price`. Returns (order_id, price, info)."""
     px = round(min(max(float(price), 0.001), ENTRY_MAX), 3)
     logger.info(f"📌 LIMIT BUY {shares} @ {px}")
     if DRY_RUN:
-        logger.info("🧪 DRY_RUN — limit buy not sent")
-        return "DRYRUN-BUY", px
+        return "DRYRUN-BUY", px, {"status": "dry_run", "success": True}
     try:
         args = OrderArgs(token_id=token_id, price=px, size=shares, side=BUY)
         resp = _post_with_retry(lambda: get_client().create_and_post_order(args, order_type=OrderType.GTC))
         logger.info(f"✅ LIMIT BUY resp: {resp}")
-        return (resp.get("orderID") or resp.get("id")), px
+        return _order_id(resp), px, resp
     except Exception as e:
         logger.error(f"❌ limit buy failed: {e}")
-        return None, None
+        return None, None, {"error": _err_text(e)}
 
 def place_sell(token_id, price, shares, label="SELL"):
     logger.info(f"💱 {label} limit {price} x {shares}")
