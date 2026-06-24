@@ -34,6 +34,7 @@ logger = logging.getLogger("pm_client")
 
 HOST       = "https://clob.polymarket.com"
 GAMMA      = "https://gamma-api.polymarket.com"
+DATA       = "https://data-api.polymarket.com"
 
 HTTP_TIMEOUT_S  = int(os.getenv("HTTP_TIMEOUT_S", "5"))
 ENTRY_BUFFER    = float(os.getenv("ENTRY_BUFFER", "0.01"))
@@ -176,6 +177,38 @@ def fetch_event(event_slug):
     d = _gamma_get({"slug": event_slug})
     return d[0] if d else None
 
+def funder_address():
+    return _clean_secret(os.getenv("FUNDER_ADDRESS") or "")
+
+def get_wallet_positions(wallet=None, weather_only=True):
+    """Live positions for the wallet from the public Data API. Each item has
+    `asset` (the token id to sell), `size` (shares), avgPrice/curPrice, title.
+    weather_only keeps only temperature/weather markets."""
+    wallet = wallet or funder_address()
+    if not wallet:
+        return []
+    for _ in range(3):
+        try:
+            r = requests.get(f"{DATA}/positions",
+                             params={"user": wallet, "limit": 200, "sizeThreshold": 0.1},
+                             timeout=HTTP_TIMEOUT_S + 5)
+            d = r.json()
+            if not isinstance(d, list):
+                return []
+            out = []
+            for p in d:
+                title = (p.get("title") or "")
+                slug = (p.get("slug") or "") + (p.get("eventSlug") or "")
+                is_w = any(k in (title + slug).lower()
+                           for k in ("temperature", "temp", "weather"))
+                if weather_only and not is_w:
+                    continue
+                out.append(p)
+            return out
+        except Exception:
+            time.sleep(0.6)
+    return []
+
 def list_temperature_events(limit=500):
     """All LIVE 'Highest temperature in <city> on <date>' events across every
     city, via the 'highest-temperature' tag. Returns the raw event list."""
@@ -264,6 +297,25 @@ def place_market_buy(token_id, dollars):
         return (resp.get("orderID") or resp.get("id")), dollars
     except Exception as e:
         logger.error(f"❌ market buy failed: {e}")
+        return None, None
+
+def place_limit_buy(token_id, price, shares):
+    """GTC limit buy at EXACTLY `price` (no marketable buffer). Placed at the
+    touch it behaves like Polymarket's 'Limit' mode — it accepts small orders
+    (e.g. 5 shares @ 3¢) that a marketable buy would reject on the $1 min.
+    Returns (order_id, price) or (None, None)."""
+    px = round(min(max(float(price), 0.001), ENTRY_MAX), 3)
+    logger.info(f"📌 LIMIT BUY {shares} @ {px}")
+    if DRY_RUN:
+        logger.info("🧪 DRY_RUN — limit buy not sent")
+        return "DRYRUN-BUY", px
+    try:
+        args = OrderArgs(token_id=token_id, price=px, size=shares, side=BUY)
+        resp = get_client().create_and_post_order(args, order_type=OrderType.GTC)
+        logger.info(f"✅ LIMIT BUY resp: {resp}")
+        return (resp.get("orderID") or resp.get("id")), px
+    except Exception as e:
+        logger.error(f"❌ limit buy failed: {e}")
         return None, None
 
 def place_sell(token_id, price, shares, label="SELL"):

@@ -229,10 +229,12 @@ def render_card(sess):
             edge_line = (f"\n🧮 <b>Edge</b>: {len(sel_idx)} buckets cost {cost*100:.0f}¢/set ≥ $1 → "
                          f"<i>no edge (overpriced together)</i>")
 
+    mode = s.get("order_mode", "LIMIT")
+    mode_str = "📌 Limit (rests, any size)" if mode == "LIMIT" else "⚡ Market (cross, $1 min)"
     foot = (
         f"\nSelected: <b>{sel}</b>{edge_line}\n"
         f"Unit: <b>{'💵 USD' if unit=='USD' else '📊 Shares'}</b> · "
-        f"Amount: <b>{amt_str}</b>"
+        f"Amount: <b>{amt_str}</b> · Order: <b>{mode_str}</b>"
         + ("  (applied to each)" if len(sel_idx) > 1 else "")
     )
     return head + "\n".join(lines) + foot
@@ -255,6 +257,12 @@ def render_keyboard(sess):
     kb.append([
         {"text": ("● " if u == "USD" else "") + "💵 USD",   "callback_data": f"b|{sid}|u|USD"},
         {"text": ("● " if u == "SHARES" else "") + "📊 Shares", "callback_data": f"b|{sid}|u|SHARES"},
+    ])
+    # order-mode row
+    om = s.get("order_mode", "LIMIT")
+    kb.append([
+        {"text": ("● " if om == "LIMIT" else "") + "📌 Limit", "callback_data": f"b|{sid}|m|LIMIT"},
+        {"text": ("● " if om == "MARKET" else "") + "⚡ Market", "callback_data": f"b|{sid}|m|MARKET"},
     ])
     # amount presets
     presets = USD_PRESETS if u == "USD" else SHARE_PRESETS
@@ -312,6 +320,7 @@ def handle_new_signal(sig):
         "selected": set(),
         "unit": DEFAULT_UNIT if DEFAULT_UNIT in ("USD", "SHARES") else "USD",
         "amount": None,
+        "order_mode": "LIMIT",          # LIMIT (rest, any size) | MARKET (cross, $1 min)
         "chat_id": PRIMARY_CHAT,
         "message_id": None,
         "status": "pending",
@@ -517,10 +526,18 @@ def _shares_for(unit, amount, ask):
     return shares, (shares > want)
 
 def _buy_one(slug, bucket, side, city, target_date, unit_sym, amount, unit,
-             tp_price, sl_price, chat, preset_token=None):
-    """Place ONE whole-share marketable limit buy and register it for TP/SL.
-    Returns (pid_or_None, result_line). Used by both the multi-select flow
-    and one-tap webhook buys so behavior is identical."""
+             tp_price, sl_price, chat, preset_token=None, order_mode="LIMIT"):
+    """Place ONE whole-share buy and register it for TP/SL.
+
+    order_mode:
+      LIMIT  — place a GTC limit AT the price (Polymarket 'Limit' mode). No
+               $1 minimum, so small buys like 5 sh @ 3¢ go through. If it
+               doesn't fill immediately it RESTS on the book (no TP/SL until
+               it fills); we don't cancel it.
+      MARKET — marketable buy that crosses to fill now; Polymarket enforces a
+               $1 minimum, so we reject sub-$1 share orders with guidance.
+
+    Returns (pid_or_None, result_line)."""
     rtoken, market = pm.resolve_token(slug, bucket, side)
     token = preset_token or rtoken
     if not token:
@@ -529,24 +546,34 @@ def _buy_one(slug, bucket, side, city, target_date, unit_sym, amount, unit,
     if ask is None:
         return None, f"❌ {bucket}{unit_sym}: no live price"
     shares, bumped = _shares_for(unit, amount, ask)
-    # Don't silently 100× a share order to hit the $1 minimum — reject and
-    # tell the user the real minimum for this (often very cheap) bucket.
-    if shares * ask < MIN_ORDER_USD - 1e-6:
-        need = math.ceil(MIN_ORDER_USD / ask)
-        return None, (f"❌ {bucket}{unit_sym}: {shares} sh = ${shares*ask:.2f}, below "
-                      f"Polymarket's $1 min. Need ~{need} sh at {_fmt_cents(ask)} "
-                      f"— increase shares, or use 💵 USD mode.")
-    max_price = round(ask + 0.05, 3)
-    oid, limit = pm.place_buy(token, ask, max_price, shares)
+
+    if order_mode == "MARKET":
+        # marketable: enforce the $1 minimum (don't silently 100× the size)
+        if shares * ask < MIN_ORDER_USD - 1e-6:
+            need = math.ceil(MIN_ORDER_USD / ask)
+            return None, (f"❌ {bucket}{unit_sym}: {shares} sh = ${shares*ask:.2f}, below "
+                          f"Polymarket's $1 min for a MARKET buy. Need ~{need} sh, "
+                          f"use 💵 USD, or switch to 📌 Limit.")
+        oid, limit = pm.place_buy(token, ask, round(ask + 0.05, 3), shares)
+    else:
+        # limit at the touch — accepts any size ≥ 5 shares
+        oid, limit = pm.place_limit_buy(token, ask, shares)
+
     if not oid:
         return None, f"❌ {bucket}{unit_sym}: order rejected"
+
     filled = _await_fill(oid)
-    if filled == 0:
-        pm.cancel_order(oid)
-        return None, f"⚠️ {bucket}{unit_sym}: not filled, cancelled"
     held = shares if filled < 0 else int(filled)
+    if filled == 0:
+        if order_mode == "MARKET":
+            pm.cancel_order(oid)
+            return None, f"⚠️ {bucket}{unit_sym}: not filled, cancelled"
+        # LIMIT: leave it resting on the book
+        return None, (f"📌 {bucket}{unit_sym}: limit for {shares} sh @ {limit:.3f} "
+                      f"RESTING (fills when matched; no TP/SL until then)")
     if held <= 0:
         return None, f"⚠️ {bucket}{unit_sym}: 0 shares filled"
+
     pid = _next_pid()
     end_ts = pm.market_end_ts(market) or (time.time() + MAX_HOLD_HOURS * 3600)
     positions[pid] = {
@@ -557,9 +584,9 @@ def _buy_one(slug, bucket, side, city, target_date, unit_sym, amount, unit,
         "tp_done": False, "sl_done": False, "status": "open", "chat_id": chat,
     }
     save_state()
-    note = (f" — min {MIN_SHARES}sh/$1" if bumped else "")
-    return pid, (f"✅ {bucket}{unit_sym}: bought {held} sh @ ~{limit:.2f} "
-                 f"(~${held * limit:.2f}{note}, pid {pid})")
+    mode_tag = "📌" if order_mode == "LIMIT" else "⚡"
+    return pid, (f"✅ {mode_tag} {bucket}{unit_sym}: bought {held} sh @ ~{limit:.2f} "
+                 f"(~${held * limit:.2f}, pid {pid})")
 
 def execute_buys(sess, cb_chat):
     if not sess["selected"]:
@@ -581,7 +608,8 @@ def execute_buys(sess, cb_chat):
                 sess["event_slug"], c["bucket"], c.get("side", "YES"),
                 sess["city"], sess["target_date"], sess["unit_sym"],
                 sess["amount"], sess["unit"], sess["tp_price"], sess["sl_price"],
-                sess["chat_id"], preset_token=c.get("token_id"))
+                sess["chat_id"], preset_token=c.get("token_id"),
+                order_mode=sess.get("order_mode", "LIMIT"))
             results.append(line)
 
     sess["status"] = "done"
@@ -626,6 +654,59 @@ def do_sell(pos, cb_chat=None):
            f"(entry {_fmt_cents(pos['entry_price'])})")
     send_message(cb_chat or pos["chat_id"], msg)
     logger.info(msg)
+
+# ── manual position selling (ANY wallet position, via the Data API) ──
+sell_sessions = {}          # sxid -> {token, size, label}
+_sxid_counter = 0
+
+def _next_sxid():
+    global _sxid_counter
+    _sxid_counter += 1
+    return "s" + format(_sxid_counter, "x")
+
+def _send_positions(chat):
+    send_message(chat, "🔎 Fetching your wallet positions …")
+    poss = pm.get_wallet_positions()
+    shown = 0
+    for p in poss:
+        size = float(p.get("size") or 0)
+        token = p.get("asset")
+        if size < 1 or not token:
+            continue
+        title = p.get("title") or "?"
+        outcome = p.get("outcome") or ""
+        avg = p.get("avgPrice"); cur = p.get("curPrice")
+        pnl = p.get("cashPnl"); pct = p.get("percentPnl")
+        txt = (f"📊 <b>{title}</b>\n{outcome} · {size:g} sh · "
+               f"avg {_fmt_cents(avg)} → now {_fmt_cents(cur)}"
+               + (f" · P&amp;L ${pnl:+.2f} ({pct:+.0f}%)" if isinstance(pnl, (int, float)) else ""))
+        if p.get("redeemable"):
+            send_message(chat, txt + "\n✅ <i>Resolved — claim/redeem in the Polymarket UI.</i>")
+        else:
+            sxid = _next_sxid()
+            sell_sessions[sxid] = {"token": token, "size": int(size),
+                                   "label": f"{outcome} {title}"}
+            kb = [[{"text": f"💱 Sell {int(size)} sh (market)", "callback_data": f"sx|{sxid}|m"},
+                   {"text": "📌 Sell limit", "callback_data": f"sx|{sxid}|l"}]]
+            send_message(chat, txt, kb)
+        shown += 1
+    if shown == 0:
+        send_message(chat, "No open weather positions found for the funder wallet.")
+
+def _do_wallet_sell(ss, chat, mode="m"):
+    token, size, label = ss["token"], ss["size"], ss["label"]
+    with _order_lock:
+        if mode == "l":
+            bid = pm.best_bid(token)
+            px = bid if (bid and bid > 0) else 0.5
+            oid = pm.place_sell(token, round(px, 3), size, label="LIMIT-SELL")
+        else:
+            oid, px = pm.sell_cross_book(token, size, label="SELL")
+    if oid:
+        send_message(chat, f"💱 Sell placed: {size} sh of {label} @ ~{_fmt_cents(px)}")
+        logger.info(f"manual sell {label}: {size} @ {px}")
+    else:
+        send_message(chat, f"❌ Sell failed for {label} — try the other mode or the UI.")
 
 # ===================== WEBHOOK SIGNALS (one-tap buy) =====================
 # Your forecast/signal bot POSTs a JSON payload here when it finds a trade.
@@ -807,6 +888,10 @@ def handle_callback(cb):
             sess["amount"] = None            # reset amount on unit change
             answer_callback(cb_id, f"Unit: {parts[3]}")
             push_card(sess)
+        elif act == "m":                     # order mode (Limit/Market)
+            sess["order_mode"] = parts[3]
+            answer_callback(cb_id, f"Order: {parts[3]}")
+            push_card(sess)
         elif act == "a":                     # preset amount
             sess["amount"] = float(parts[3])
             answer_callback(cb_id, f"Amount set")
@@ -848,6 +933,17 @@ def handle_callback(cb):
             answer_callback(cb_id, "Holding.")
             send_message(chat, f"✋ Holding {pos['bucket']}{pos['unit_sym']} — "
                                f"I'll prompt again if it hits the other level.")
+        return
+
+    # ── manual sell of a wallet position (/positions buttons) ──
+    if kind == "sx" and len(parts) >= 3:
+        ss = sell_sessions.get(parts[1])
+        if not ss:
+            answer_callback(cb_id, "List expired — send /positions again")
+            return
+        answer_callback(cb_id, "Selling…")
+        threading.Thread(target=_do_wallet_sell, args=(ss, chat, parts[2]),
+                         daemon=True).start()
         return
 
     # ── markets-browser pick → build that event's card ──
@@ -901,7 +997,10 @@ def handle_text(msg):
                 "Nothing is pre-selected and I ask before every sell.\n\n"
                 "/markets [city] — browse ALL live temperature markets and pick one\n"
                 "/test [event-slug] — card from a specific live event\n"
-                "/positions — list open trades\n/help — this message")
+                "/positions (or /sell) — list wallet positions with Sell buttons\n"
+                "/help — this message\n\n"
+                "On a buy card: 📌 <b>Limit</b> = rests at the price, accepts any "
+                "size (even 5 sh @ 3¢); ⚡ <b>Market</b> = fills now ($1 min).")
         elif cmd == "/markets":
             parts = text.split(maxsplit=1)
             city_filter = parts[1].strip().lower() if len(parts) > 1 else None
@@ -921,15 +1020,8 @@ def handle_text(msg):
                                    f"Pass a live event slug: <code>/test highest-temperature-in-london-on-june-24-2026</code>")
             else:
                 handle_new_signal(sig)
-        elif cmd == "/positions":
-            opens = [p for p in positions.values() if p["status"] == "open"]
-            if not opens:
-                send_message(chat, "No open positions.")
-            else:
-                lines = [f"• {p['bucket']}{p['unit_sym']} {p['city'].title()} · "
-                         f"{p['shares']} sh @ {_fmt_cents(p['entry_price'])} (pid {p['pid']})"
-                         for p in opens]
-                send_message(chat, "<b>Open positions</b>\n" + "\n".join(lines))
+        elif cmd in ("/positions", "/sell"):
+            threading.Thread(target=_send_positions, args=(chat,), daemon=True).start()
         return
 
     # custom amount reply?
