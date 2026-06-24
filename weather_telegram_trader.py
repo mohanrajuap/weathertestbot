@@ -192,6 +192,24 @@ def _short_oid(oid):
     o = str(oid or "")
     return (o[:8] + "…" + o[-4:]) if len(o) > 14 else o
 
+def _fmt_sh(x):
+    """Show whole shares as an integer, fractional with 4 dp (no trailing 0s)."""
+    try:
+        x = float(x)
+    except Exception:
+        return "?"
+    if abs(x - round(x)) < 1e-9:
+        return str(int(round(x)))
+    return f"{x:.4f}".rstrip("0").rstrip(".")
+
+def _sellable_size(size):
+    """Full position size, floored to 4 dp so we never try to sell more than
+    the wallet holds (avoids over-balance rejects from rounding up)."""
+    try:
+        return math.floor(float(size) * 10000) / 10000
+    except Exception:
+        return 0.0
+
 def render_card(sess):
     s = sess
     unit = s["unit"]
@@ -577,9 +595,9 @@ def _buy_one(slug, bucket, side, city, target_date, unit_sym, amount, unit,
                       f"🆔 <code>{oid_s}</code> · 📡 <i>{status or 'killed'}</i>")
 
     if filled < 0:                                   # DRY_RUN sentinel
-        held = max(1, int(round(dollars / ask))) if unit == "USD" else shares
+        held = round(dollars / ask, 4) if unit == "USD" else float(shares)
     else:
-        held = int(filled)
+        held = round(float(filled), 4)               # keep fractional (market fills)
     if held <= 0:
         return None, f"⚠️ <b>{b}</b>: 0 shares filled (🆔 <code>{oid_s}</code>)"
 
@@ -596,7 +614,7 @@ def _buy_one(slug, bucket, side, city, target_date, unit_sym, amount, unit,
     save_state()
     how = "⚡ market" if unit == "USD" else "📊 limit"
     pm_status = "dry-run" if pm.DRY_RUN else (status or "matched")
-    return pid, (f"✅ <b>BOUGHT {held} × {b}</b> ({how})\n"
+    return pid, (f"✅ <b>BOUGHT {_fmt_sh(held)} × {b}</b> ({how})\n"
                  f"avg ~{_fmt_cents(entry)} · spent ~${held * entry:.2f}\n"
                  f"🆔 <code>{oid_s}</code> · 📡 Polymarket: <i>{pm_status} ✓</i>\n"
                  f"👁 watching TP {_fmt_cents(tp_price)} / SL {_fmt_cents(sl_price)} · pid {pid}")
@@ -653,7 +671,7 @@ def send_exit_prompt(pos, kind, bid):
     text = (
         f"{emoji} <b>{pos['city'].title()} {pos['bucket']}{pos['unit_sym']} hit {label}</b>\n"
         f"bid <b>{_fmt_cents(bid)}</b> · entry {_fmt_cents(pos['entry_price'])} · "
-        f"{pos['shares']} sh · est P&amp;L <b>${pnl:+.2f}</b>\n"
+        f"{_fmt_sh(pos['shares'])} sh · est P&amp;L <b>${pnl:+.2f}</b>\n"
         f"Sell now?"
     )
     kb = [[
@@ -670,10 +688,10 @@ def _send_sell_prompt(pid, chat):
     pos = positions.get(pid)
     if not pos or pos["status"] != "open":
         return
-    txt = (f"📊 Holding <b>{pos['shares']} × {pos['bucket']}{pos['unit_sym']}</b> "
+    txt = (f"📊 Holding <b>{_fmt_sh(pos['shares'])} × {pos['bucket']}{pos['unit_sym']}</b> "
            f"({pos['city'].title()}) @ {_fmt_cents(pos['entry_price'])} · pid {pid}\n"
            f"Sell whenever you like:")
-    kb = [[{"text": "💱 Sell now (market)", "callback_data": f"bs|{pid}|m"},
+    kb = [[{"text": f"💱 Sell all {_fmt_sh(pos['shares'])} sh", "callback_data": f"bs|{pid}|m"},
            {"text": "📌 Sell limit", "callback_data": f"bs|{pid}|l"}]]
     send_message(chat, txt, kb)
 
@@ -682,7 +700,8 @@ def _sell_bot_position(pid, chat, mode="m"):
     if not pos or pos["status"] != "open":
         send_message(chat, "Position no longer open.")
         return
-    token, size = pos["token_id"], pos["shares"]
+    token = pos["token_id"]
+    size = _sellable_size(pos["shares"])        # sell the WHOLE holding (fractional)
     with _order_lock:
         if mode == "l":
             bid = pm.best_bid(token)
@@ -698,7 +717,7 @@ def _sell_bot_position(pid, chat, mode="m"):
     save_state()
     pnl = (px - pos["entry_price"]) * size
     send_message(chat,
-        f"💱 <b>SOLD {size} × {pos['bucket']}{pos['unit_sym']}</b> @ ~{_fmt_cents(px)}\n"
+        f"💱 <b>SOLD {_fmt_sh(size)} × {pos['bucket']}{pos['unit_sym']}</b> @ ~{_fmt_cents(px)}\n"
         f"entry {_fmt_cents(pos['entry_price'])} · est P&amp;L <b>${pnl:+.2f}</b>\n"
         f"🆔 <code>{_short_oid(oid)}</code> · 📡 Polymarket: <i>"
         + ("dry-run" if pm.DRY_RUN else "order placed") + " ✓</i>")
@@ -718,24 +737,24 @@ def _send_positions(chat):
     poss = pm.get_wallet_positions()
     shown = 0
     for p in poss:
-        size = float(p.get("size") or 0)
+        size = _sellable_size(p.get("size"))      # full holding (fractional OK)
         token = p.get("asset")
-        if size < 1 or not token:
+        if size <= 0 or not token:
             continue
         title = p.get("title") or "?"
         outcome = p.get("outcome") or ""
         avg = p.get("avgPrice"); cur = p.get("curPrice")
         pnl = p.get("cashPnl"); pct = p.get("percentPnl")
-        txt = (f"📊 <b>{title}</b>\n{outcome} · {size:g} sh · "
+        txt = (f"📊 <b>{title}</b>\n{outcome} · {_fmt_sh(size)} sh · "
                f"avg {_fmt_cents(avg)} → now {_fmt_cents(cur)}"
                + (f" · P&amp;L ${pnl:+.2f} ({pct:+.0f}%)" if isinstance(pnl, (int, float)) else ""))
         if p.get("redeemable"):
             send_message(chat, txt + "\n✅ <i>Resolved — claim/redeem in the Polymarket UI.</i>")
         else:
             sxid = _next_sxid()
-            sell_sessions[sxid] = {"token": token, "size": int(size),
+            sell_sessions[sxid] = {"token": token, "size": size,    # full fractional size
                                    "label": f"{outcome} {title}"}
-            kb = [[{"text": f"💱 Sell {int(size)} sh (market)", "callback_data": f"sx|{sxid}|m"},
+            kb = [[{"text": f"💱 Sell all {_fmt_sh(size)} sh", "callback_data": f"sx|{sxid}|m"},
                    {"text": "📌 Sell limit", "callback_data": f"sx|{sxid}|l"}]]
             send_message(chat, txt, kb)
         shown += 1
@@ -752,7 +771,10 @@ def _do_wallet_sell(ss, chat, mode="m"):
         else:
             oid, px = pm.sell_cross_book(token, size, label="SELL")
     if oid:
-        send_message(chat, f"💱 Sell placed: {size} sh of {label} @ ~{_fmt_cents(px)}")
+        send_message(chat,
+            f"💱 <b>SOLD all {_fmt_sh(size)} sh</b> of {label} @ ~{_fmt_cents(px)}\n"
+            f"🆔 <code>{_short_oid(oid)}</code> · 📡 Polymarket: <i>"
+            + ("dry-run" if pm.DRY_RUN else "order placed") + " ✓</i>")
         logger.info(f"manual sell {label}: {size} @ {px}")
     else:
         send_message(chat, f"❌ Sell failed for {label} — try the other mode or the UI.")
