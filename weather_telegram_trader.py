@@ -613,21 +613,26 @@ def execute_buys(sess, cb_chat):
     edit_message(sess["chat_id"], sess["message_id"],
                  render_card(sess) + "\n\n⏳ <i>Placing orders…</i>", [])
 
-    results = []
+    results, bought_pids = [], []
     with _order_lock:
         for i in sorted(sess["selected"]):
             c = sess["candidates"][i]
-            _, line = _buy_one(
+            pid, line = _buy_one(
                 sess["event_slug"], c["bucket"], c.get("side", "YES"),
                 sess["city"], sess["target_date"], sess["unit_sym"],
                 sess["amount"], sess["unit"], sess["tp_price"], sess["sl_price"],
                 sess["chat_id"], preset_token=c.get("token_id"))
             results.append(line)
+            if pid:
+                bought_pids.append(pid)
 
     sess["status"] = "done"
     edit_message(sess["chat_id"], sess["message_id"],
                  render_card(sess) + "\n\n<b>Result</b>\n" + "\n".join(results), [])
     logger.info(f"🧾 Buys for {sess['sid']}: {results}")
+    # offer an immediate Sell on each position just bought
+    for pid in bought_pids:
+        _send_sell_prompt(pid, cb_chat)
 
 def _await_fill(order_id):
     start = time.time()
@@ -658,14 +663,46 @@ def send_exit_prompt(pos, kind, bid):
     send_message(pos["chat_id"], text, kb)
 
 def do_sell(pos, cb_chat=None):
+    _sell_bot_position(pos["pid"], cb_chat or pos["chat_id"], mode="m")
+
+def _send_sell_prompt(pid, chat):
+    """A standalone message with Sell buttons for a bot-tracked position."""
+    pos = positions.get(pid)
+    if not pos or pos["status"] != "open":
+        return
+    txt = (f"📊 Holding <b>{pos['shares']} × {pos['bucket']}{pos['unit_sym']}</b> "
+           f"({pos['city'].title()}) @ {_fmt_cents(pos['entry_price'])} · pid {pid}\n"
+           f"Sell whenever you like:")
+    kb = [[{"text": "💱 Sell now (market)", "callback_data": f"bs|{pid}|m"},
+           {"text": "📌 Sell limit", "callback_data": f"bs|{pid}|l"}]]
+    send_message(chat, txt, kb)
+
+def _sell_bot_position(pid, chat, mode="m"):
+    pos = positions.get(pid)
+    if not pos or pos["status"] != "open":
+        send_message(chat, "Position no longer open.")
+        return
+    token, size = pos["token_id"], pos["shares"]
     with _order_lock:
-        oid, px = pm.sell_cross_book(pos["token_id"], pos["shares"], label="SELL")
+        if mode == "l":
+            bid = pm.best_bid(token)
+            px = round(bid if (bid and bid > 0) else 0.5, 3)
+            oid = pm.place_sell(token, px, size, label="LIMIT-SELL")
+        else:
+            oid, px = pm.sell_cross_book(token, size, label="SELL")
+    if not oid:
+        send_message(chat, f"❌ <b>Sell failed</b> for {pos['bucket']}{pos['unit_sym']} "
+                           f"— try the other mode or the Polymarket UI.")
+        return
     pos["status"] = "closed"
     save_state()
-    msg = (f"💱 Sold {pos['shares']} {pos['bucket']}{pos['unit_sym']} @ ~{_fmt_cents(px)} "
-           f"(entry {_fmt_cents(pos['entry_price'])})")
-    send_message(cb_chat or pos["chat_id"], msg)
-    logger.info(msg)
+    pnl = (px - pos["entry_price"]) * size
+    send_message(chat,
+        f"💱 <b>SOLD {size} × {pos['bucket']}{pos['unit_sym']}</b> @ ~{_fmt_cents(px)}\n"
+        f"entry {_fmt_cents(pos['entry_price'])} · est P&amp;L <b>${pnl:+.2f}</b>\n"
+        f"🆔 <code>{_short_oid(oid)}</code> · 📡 Polymarket: <i>"
+        + ("dry-run" if pm.DRY_RUN else "order placed") + " ✓</i>")
+    logger.info(f"sold {pos['bucket']} {size} @ {px}")
 
 # ── manual position selling (ANY wallet position, via the Data API) ──
 sell_sessions = {}          # sxid -> {token, size, label}
@@ -863,6 +900,8 @@ def do_quick_buy(qid, chat):
             DEFAULT_TP_PRICE, DEFAULT_SL_PRICE, chat)
     send_message(chat, line)
     logger.info(f"⚡ one-tap buy: {line}")
+    if pid:
+        _send_sell_prompt(pid, chat)
 
 # ===================== CALLBACK HANDLING =====================
 
@@ -943,6 +982,17 @@ def handle_callback(cb):
                                f"I'll prompt again if it hits the other level.")
         return
 
+    # ── sell a bot-tracked position (Sell button under a buy) ──
+    if kind == "bs" and len(parts) >= 3:
+        pid = parts[1]
+        if pid not in positions or positions[pid]["status"] != "open":
+            answer_callback(cb_id, "Position no longer open.")
+            return
+        answer_callback(cb_id, "Selling…")
+        threading.Thread(target=_sell_bot_position, args=(pid, chat, parts[2]),
+                         daemon=True).start()
+        return
+
     # ── manual sell of a wallet position (/positions buttons) ──
     if kind == "sx" and len(parts) >= 3:
         ss = sell_sessions.get(parts[1])
@@ -987,7 +1037,45 @@ def handle_callback(cb):
         threading.Thread(target=do_quick_buy, args=(qid, chat), daemon=True).start()
         return
 
+    # ── main-menu buttons ──
+    if kind == "menu" and len(parts) >= 2:
+        what = parts[1]
+        answer_callback(cb_id)
+        if what == "markets":
+            threading.Thread(target=_send_markets_menu, args=(chat, None), daemon=True).start()
+        elif what == "positions":
+            threading.Thread(target=_send_positions, args=(chat,), daemon=True).start()
+        elif what == "test":
+            send_message(chat, "🧪 Send <code>/test &lt;event-slug&gt;</code>, or just use "
+                               "🛒 Buy to pick a live market.")
+        elif what == "help":
+            handle_text({"chat": {"id": chat}, "text": "/help"})
+        return
+
     answer_callback(cb_id)
+
+def _send_main_menu(chat):
+    txt = ("🌡️ <b>Weather Trader — menu</b>\n"
+           "Pick an action (or use the ☰ menu / commands):")
+    kb = [
+        [{"text": "🛒 Buy — browse markets", "callback_data": "menu|markets"}],
+        [{"text": "💼 Positions & Sell", "callback_data": "menu|positions"}],
+        [{"text": "🧪 Test a market", "callback_data": "menu|test"},
+         {"text": "❓ Help", "callback_data": "menu|help"}],
+    ]
+    send_message(chat, txt, kb)
+
+def set_bot_commands():
+    """Register the ☰ command menu shown in Telegram."""
+    cmds = [
+        {"command": "menu",      "description": "📋 Main menu"},
+        {"command": "markets",   "description": "🛒 Browse markets & buy"},
+        {"command": "positions", "description": "💼 Your positions & sell"},
+        {"command": "sell",      "description": "💱 Sell a position"},
+        {"command": "test",      "description": "🧪 Buy card for a market"},
+        {"command": "help",      "description": "❓ How it works"},
+    ]
+    tg("setMyCommands", commands=cmds)
 
 def handle_text(msg):
     chat = str((msg.get("chat") or {}).get("id", ""))
@@ -998,18 +1086,20 @@ def handle_text(msg):
 
     if text.startswith("/"):
         cmd = text.split()[0].lower()
-        if cmd in ("/start", "/help"):
+        if cmd in ("/start", "/menu"):
+            _send_main_menu(chat)
+        elif cmd == "/help":
             send_message(chat,
-                "🌡️ <b>Weather Trader</b>\nI send a card when your forecast bot "
-                "finds a trade. Tap the bucket(s) you want, set amount, Confirm. "
-                "Nothing is pre-selected and I ask before every sell.\n\n"
-                "/markets [city] — browse ALL live temperature markets and pick one\n"
-                "/test [event-slug] — card from a specific live event\n"
-                "/positions (or /sell) — list wallet positions with Sell buttons\n"
-                "/help — this message\n\n"
+                "🌡️ <b>Weather Trader — how it works</b>\n"
+                "I trade Polymarket 'highest temperature' markets. Use the menu "
+                "or these commands:\n\n"
+                "🛒 /markets [city] — browse live markets &amp; buy\n"
+                "💼 /positions (/sell) — your positions with Sell buttons\n"
+                "🧪 /test [slug] — buy card for a specific market\n"
+                "📋 /menu — the main menu\n\n"
                 "On a buy card: 💵 <b>USD</b> = market buy of that many $ (fills "
                 "now, e.g. $1); 📊 <b>Shares</b> = limit for exactly N shares "
-                "(rests if it's a sub-$1 longshot).")
+                "(rests if it's a sub-$1 longshot). I ask before every sell.")
         elif cmd == "/markets":
             parts = text.split(maxsplit=1)
             city_filter = parts[1].strip().lower() if len(parts) > 1 else None
@@ -1213,8 +1303,10 @@ def main():
     except Exception as e:
         logger.error(f"❌ Polymarket client init failed: {e}")
         sys.exit(1)
-    send_message(PRIMARY_CHAT, "🌡️ Weather Trader online. I'll send a card when a "
-                               "trade is found." + ("  <i>(DRY_RUN)</i>" if pm.DRY_RUN else ""))
+    set_bot_commands()        # register the ☰ command menu
+    send_message(PRIMARY_CHAT, "🌡️ Weather Trader online."
+                 + ("  <i>(DRY_RUN)</i>" if pm.DRY_RUN else ""))
+    _send_main_menu(PRIMARY_CHAT)
 
     threads = [
         threading.Thread(target=telegram_loop, daemon=True),
