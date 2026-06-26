@@ -210,90 +210,71 @@ def _sellable_size(size):
     except Exception:
         return 0.0
 
+def _unit_word(unit):
+    return "$" if unit == "USD" else "sh"
+
 def render_card(sess):
     s = sess
     unit = s["unit"]
-    amt = s["amount"]
+    qty = s["qty"]
+    step_word = "USD per bucket (market, fills now)" if unit == "USD" else "shares per bucket (limit)"
     head = (
-        f"📈 <b>Trade found — {s['city'].title()} "
-        f"({s['target_date']})</b>\n"
-        f"Select position(s) to buy, set unit &amp; amount, then Confirm.\n"
+        f"📈 <b>{s['city'].title()} ({s['target_date']})</b>\n"
+        f"Dial a quantity per bucket with −/+, then Confirm. "
+        f"Unit: <b>{step_word}</b>\n"
     )
     lines = []
     for i, c in enumerate(s["candidates"]):
-        chk = "☑️" if i in s["selected"] else "▫️"
         star = "⭐" if c.get("is_best") else ""
         price = c.get("price")
-        # per-share upside if THIS bucket wins: a YES share pays $1, so
-        # profit = (1 - price). e.g. 45¢ → +55¢/sh.
         win = f"win +{(1.0 - price) * 100:.0f}¢" if isinstance(price, (int, float)) else ""
+        n = qty.get(i, 0)
+        mark = f" → <b>{n}{_unit_word(unit)}</b>" if n else ""
         lines.append(
-            f"{chk} <b>{c['bucket']}{s['unit_sym']}</b> {star} · "
-            f"mkt {_fmt_cents(price)} · {win}"
+            f"<b>{c['bucket']}{s['unit_sym']}</b> {star} · mkt {_fmt_cents(price)} · {win}{mark}"
         )
 
-    sel_idx = sorted(s["selected"])
-    sel = ", ".join(f"{s['candidates'][i]['bucket']}{s['unit_sym']}" for i in sel_idx) or "—"
-    amt_str = (f"${amt:g}" if unit == "USD" else f"{amt:g} sh") if amt else "—"
+    chosen = [(i, qty[i]) for i in sorted(qty) if qty.get(i, 0) > 0]
 
-    # ── edge calculator for the SELECTED combination ──
-    edge_line = ""
-    if sel_idx:
-        cost = sum((s["candidates"][i].get("price") or 0.0) for i in sel_idx)
-        edge = 1.0 - cost
-        ret = (edge / cost * 100) if cost > 0 else 0
-        if len(sel_idx) == 1:
-            edge_line = (f"\n🧮 <b>Edge</b>: pay {cost*100:.0f}¢ → $1 if it hits · "
-                         f"+{edge*100:.0f}¢/sh ({ret:.0f}%)")
-        elif edge > 0:
-            edge_line = (f"\n🧮 <b>Edge</b>: {len(sel_idx)} buckets cost {cost*100:.0f}¢/set → "
-                         f"$1 if it lands in any · +{edge*100:.0f}¢/set ({ret:.0f}%) — "
-                         f"<i>no loss if the high is in your range</i>")
+    # ── basket summary ──
+    summary = ""
+    if chosen:
+        usym = s["unit_sym"]
+        if unit == "USD":
+            total = sum(n for _, n in chosen)
+            items = ", ".join("${0}×{1}{2}".format(n, s["candidates"][i]["bucket"], usym)
+                              for i, n in chosen)
+            summary = "\n🧺 <b>Basket</b>: {0} = <b>~${1}</b>".format(items, total)
         else:
-            edge_line = (f"\n🧮 <b>Edge</b>: {len(sel_idx)} buckets cost {cost*100:.0f}¢/set ≥ $1 → "
-                         f"<i>no edge (overpriced together)</i>")
-
-    how = ("💵 USD → market (fills now, spends $)" if unit == "USD"
-           else "📊 Shares → limit (exact count; rests if &lt; $1)")
-    foot = (
-        f"\nSelected: <b>{sel}</b>{edge_line}\n"
-        f"<b>{how}</b> · Amount: <b>{amt_str}</b>"
-        + ("  (applied to each)" if len(sel_idx) > 1 else "")
-    )
-    return head + "\n".join(lines) + foot
+            cost = sum((s["candidates"][i].get("price") or 0) * n for i, n in chosen)
+            items = ", ".join("{0}×{1}{2}".format(n, s["candidates"][i]["bucket"], usym)
+                              for i, n in chosen)
+            summary = ("\n🧺 <b>Basket</b>: {0}\ncost ~${1:.2f} · you get $1 per share "
+                       "of whichever bucket wins".format(items, cost))
+    return head + "\n".join(lines) + summary
 
 def render_keyboard(sess):
     s = sess
     sid = s["sid"]
+    qty = s["qty"]
     kb = []
-    # one toggle button per candidate (price + upside if it wins)
+    # per-bucket stepper: [−] [24°C 40¢ ×N] [+]
     for i, c in enumerate(s["candidates"]):
-        chk = "☑️" if i in s["selected"] else "▫️"
         price = c.get("price")
-        win = f" · win +{(1.0 - price) * 100:.0f}¢" if isinstance(price, (int, float)) else ""
-        kb.append([{
-            "text": f"{chk} {c['bucket']}{s['unit_sym']} · {_fmt_cents(price)}{win}",
-            "callback_data": f"b|{sid}|t|{i}",
-        }])
-    # unit row — the unit IS the order type
+        n = qty.get(i, 0)
+        kb.append([
+            {"text": "➖", "callback_data": f"b|{sid}|q-|{i}"},
+            {"text": f"{c['bucket']}{s['unit_sym']} {_fmt_cents(price)} ×{n}",
+             "callback_data": f"b|{sid}|qz|{i}"},
+            {"text": "➕", "callback_data": f"b|{sid}|q+|{i}"},
+        ])
+    # unit row — interpret the per-bucket quantity as $ (market) or shares (limit)
     u = s["unit"]
     kb.append([
-        {"text": ("● " if u == "USD" else "") + "💵 USD · market", "callback_data": f"b|{sid}|u|USD"},
-        {"text": ("● " if u == "SHARES" else "") + "📊 Shares · limit", "callback_data": f"b|{sid}|u|SHARES"},
+        {"text": ("● " if u == "SHARES" else "") + "📊 Shares", "callback_data": f"b|{sid}|u|SHARES"},
+        {"text": ("● " if u == "USD" else "") + "💵 USD", "callback_data": f"b|{sid}|u|USD"},
+        {"text": "🔄 Refresh", "callback_data": f"b|{sid}|r"},
     ])
-    # amount presets
-    presets = USD_PRESETS if u == "USD" else SHARE_PRESETS
-    row = []
-    for n in presets:
-        label = (f"${n:g}" if u == "USD" else f"{n:g}")
-        mark = "● " if (s["amount"] == n) else ""
-        row.append({"text": mark + label, "callback_data": f"b|{sid}|a|{n:g}"})
-    kb.append(row)
-    kb.append([
-        {"text": "✏️ Custom amount", "callback_data": f"b|{sid}|c"},
-        {"text": "🔄 Refresh prices", "callback_data": f"b|{sid}|r"},
-    ])
-    # confirm / cancel
     kb.append([
         {"text": "✅ Confirm Buy", "callback_data": f"b|{sid}|go"},
         {"text": "❌ Cancel",      "callback_data": f"b|{sid}|x"},
@@ -334,15 +315,14 @@ def handle_new_signal(sig):
         "candidates": cands,
         "tp_price": float(sig.get("tp_price", DEFAULT_TP_PRICE)),
         "sl_price": float(sig.get("sl_price", DEFAULT_SL_PRICE)),
-        "selected": set(),
-        "unit": DEFAULT_UNIT if DEFAULT_UNIT in ("USD", "SHARES") else "USD",
-        "amount": None,
+        "qty": {},                                   # {candidate_index: quantity}
+        "unit": DEFAULT_UNIT if DEFAULT_UNIT in ("USD", "SHARES") else "SHARES",
         "chat_id": PRIMARY_CHAT,
         "message_id": None,
         "status": "pending",
     }
-    # NOTE: nothing is pre-selected — you only buy buckets you explicitly
-    # tap, so a card can never place a position you didn't choose.
+    # Per-bucket quantities start at 0 — you set each with the −/+ steppers,
+    # so a card never buys a bucket you didn't dial up.
     sessions[sid] = sess
     push_card(sess)
     processed.add(sid_key)
@@ -669,11 +649,9 @@ def _buy_one(slug, bucket, side, city, target_date, unit_sym, amount, unit,
                  f"👁 watching TP {_fmt_cents(tp_price)} / SL {_fmt_cents(sl_price)} · pid {pid}")
 
 def execute_buys(sess, cb_chat):
-    if not sess["selected"]:
-        send_message(cb_chat, "⚠️ No position selected — tap a bucket first.")
-        return
-    if not sess["amount"]:
-        send_message(cb_chat, "⚠️ No amount set — pick a preset or ✏️ Custom.")
+    chosen = [(i, sess["qty"][i]) for i in sorted(sess["qty"]) if sess["qty"].get(i, 0) > 0]
+    if not chosen:
+        send_message(cb_chat, "⚠️ Nothing dialed up — use ➕ on a bucket first.")
         return
 
     sess["status"] = "executing"
@@ -682,12 +660,12 @@ def execute_buys(sess, cb_chat):
 
     results, bought_pids = [], []
     with _order_lock:
-        for i in sorted(sess["selected"]):
+        for i, n in chosen:
             c = sess["candidates"][i]
             pid, line = _buy_one(
                 sess["event_slug"], c["bucket"], c.get("side", "YES"),
                 sess["city"], sess["target_date"], sess["unit_sym"],
-                sess["amount"], sess["unit"], sess["tp_price"], sess["sl_price"],
+                n, sess["unit"], sess["tp_price"], sess["sl_price"],
                 sess["chat_id"], preset_token=c.get("token_id"))
             results.append(line)
             if pid:
@@ -695,7 +673,7 @@ def execute_buys(sess, cb_chat):
 
     sess["status"] = "done"
     edit_message(sess["chat_id"], sess["message_id"],
-                 render_card(sess) + "\n\n<b>Result</b>\n" + "\n".join(results), [])
+                 render_card(sess) + "\n\n<b>Result</b>\n" + "\n\n".join(results), [])
     logger.info(f"🧾 Buys for {sess['sid']}: {results}")
     # offer an immediate Sell on each position just bought
     for pid in bought_pids:
@@ -997,22 +975,20 @@ def handle_callback(cb):
             answer_callback(cb_id, "This card has expired.")
             return
         act = parts[2]
-        if act == "t":                       # toggle candidate
+        if act in ("q+", "q-", "qz"):        # per-bucket quantity steppers
             i = int(parts[3])
-            if i in sess["selected"]:
-                sess["selected"].discard(i)
-            else:
-                sess["selected"].add(i)
+            cur = sess["qty"].get(i, 0)
+            if act == "q+":
+                sess["qty"][i] = cur + 1
+            elif act == "q-":
+                sess["qty"][i] = max(0, cur - 1)
+            else:                            # tap the label → reset that bucket to 0
+                sess["qty"][i] = 0
             answer_callback(cb_id)
             push_card(sess)
-        elif act == "u":                     # unit
+        elif act == "u":                     # unit (shares=limit / usd=market)
             sess["unit"] = parts[3]
-            sess["amount"] = None            # reset amount on unit change
             answer_callback(cb_id, f"Unit: {parts[3]}")
-            push_card(sess)
-        elif act == "a":                     # preset amount
-            sess["amount"] = float(parts[3])
-            answer_callback(cb_id, f"Amount set")
             push_card(sess)
         elif act == "r":                     # refresh live prices
             answer_callback(cb_id, "Refreshing…")
@@ -1020,13 +996,6 @@ def handle_callback(cb):
                 _apply_live_prices(sess["candidates"])
                 push_card(sess)
             threading.Thread(target=_refresh, daemon=True).start()
-        elif act == "c":                     # custom amount
-            awaiting[str(sess["chat_id"])] = sid
-            answer_callback(cb_id)
-            unit_word = "USD ($)" if sess["unit"] == "USD" else "shares"
-            send_message(sess["chat_id"],
-                         f"✏️ Reply with the amount in <b>{unit_word}</b> "
-                         f"(e.g. <code>15</code>).")
         elif act == "go":                    # confirm
             answer_callback(cb_id, "Placing…")
             threading.Thread(target=execute_buys, args=(sess, chat), daemon=True).start()
@@ -1213,25 +1182,6 @@ def handle_text(msg):
         elif cmd in ("/positions", "/sell"):
             threading.Thread(target=_send_positions, args=(chat,), daemon=True).start()
         return
-
-    # custom amount reply?
-    sid = awaiting.get(chat)
-    if sid:
-        sess = sessions.get(sid)
-        if sess and sess["status"] == "pending":
-            try:
-                val = float(text.replace("$", "").replace(",", "").strip())
-                if val <= 0:
-                    raise ValueError
-                sess["amount"] = val
-                awaiting.pop(chat, None)
-                send_message(chat, f"✅ Amount set to "
-                                   f"{('$'+format(val,'g')) if sess['unit']=='USD' else format(val,'g')+' sh'}.")
-                push_card(sess)
-            except Exception:
-                send_message(chat, "⚠️ Please reply with a positive number, e.g. 15")
-        else:
-            awaiting.pop(chat, None)
 
 # ===================== WEBHOOK HTTP SERVER =====================
 
