@@ -53,7 +53,7 @@ DEFAULT_SL_PRICE = float(os.getenv("SL_PRICE", "0.20"))
 
 # Hardcoded so NO Railway variable is needed (and stale ones can't break it).
 USD_PRESETS    = [1.0, 5.0, 10.0, 25.0, 50.0]
-SHARE_PRESETS  = [5, 10, 25, 50]
+SHARE_PRESETS  = [1, 5, 10, 25, 50]
 DEFAULT_UNIT   = "SHARES"
 # Polymarket rejects orders below BOTH a ~$1 notional AND a 5-share minimum.
 MIN_ORDER_USD  = 1.0
@@ -569,7 +569,7 @@ def _buy_one(slug, bucket, side, city, target_date, unit_sym, amount, unit,
         dollars = round(max(float(amount), MIN_ORDER_USD), 2)   # $1 minimum
         oid, _px, info = pm.place_market_buy(token, dollars)
     else:  # SHARES → limit
-        shares = max(MIN_SHARES, int(round(float(amount))))
+        shares = max(1, int(round(float(amount))))   # honor EXACT count (1 = 1)
         if shares * ask >= MIN_ORDER_USD - 1e-6:
             oid, limit_px, info = pm.place_buy(token, ask, round(ask + 0.05, 3), shares)
         else:
