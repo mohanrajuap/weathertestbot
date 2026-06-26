@@ -213,14 +213,20 @@ def _sellable_size(size):
 def _unit_word(unit):
     return "$" if unit == "USD" else "sh"
 
+def _qty_min(unit):
+    """Per-bucket minimum: limit orders need ≥5 shares; market needs ≥$1."""
+    return MIN_ORDER_USD if unit == "USD" else MIN_SHARES
+
 def render_card(sess):
     s = sess
     unit = s["unit"]
     qty = s["qty"]
-    step_word = "USD per bucket (market, fills now)" if unit == "USD" else "shares per bucket (limit)"
+    step_word = ("$ per bucket — market, fills now (min $1, can be &lt;5 sh)"
+                 if unit == "USD" else
+                 "shares per bucket — limit (min 5 sh; rests if &lt; $1)")
     head = (
         f"📈 <b>{s['city'].title()} ({s['target_date']})</b>\n"
-        f"Dial a quantity per bucket with −/+, then Confirm. "
+        f"Dial a quantity per bucket with −/+, then Confirm.\n"
         f"Unit: <b>{step_word}</b>\n"
     )
     lines = []
@@ -597,8 +603,8 @@ def _buy_one(slug, bucket, side, city, target_date, unit_sym, amount, unit,
     if unit == "USD":
         dollars = round(max(float(amount), MIN_ORDER_USD), 2)   # $1 minimum
         oid, _px, info = pm.place_market_buy(token, dollars)
-    else:  # SHARES → limit
-        shares = max(1, int(round(float(amount))))   # honor EXACT count (1 = 1)
+    else:  # SHARES → limit (Polymarket min is 5 shares for limit orders)
+        shares = max(MIN_SHARES, int(round(float(amount))))
         if shares * ask >= MIN_ORDER_USD - 1e-6:
             oid, limit_px, info = pm.place_buy(token, ask, round(ask + 0.05, 3), shares)
         else:
@@ -978,16 +984,21 @@ def handle_callback(cb):
         if act in ("q+", "q-", "qz"):        # per-bucket quantity steppers
             i = int(parts[3])
             cur = sess["qty"].get(i, 0)
+            mn = _qty_min(sess["unit"])       # 5 sh (limit) or $1 (market)
             if act == "q+":
-                sess["qty"][i] = cur + 1
+                sess["qty"][i] = mn if cur < mn else cur + 1
             elif act == "q-":
-                sess["qty"][i] = max(0, cur - 1)
+                sess["qty"][i] = 0 if cur <= mn else cur - 1
             else:                            # tap the label → reset that bucket to 0
                 sess["qty"][i] = 0
             answer_callback(cb_id)
             push_card(sess)
         elif act == "u":                     # unit (shares=limit / usd=market)
             sess["unit"] = parts[3]
+            mn = _qty_min(parts[3])           # clamp existing qtys to the new minimum
+            for k, v in list(sess["qty"].items()):
+                if 0 < v < mn:
+                    sess["qty"][k] = mn
             answer_callback(cb_id, f"Unit: {parts[3]}")
             push_card(sess)
         elif act == "r":                     # refresh live prices
