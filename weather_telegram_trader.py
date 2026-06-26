@@ -456,6 +456,55 @@ def _city_to_slug(city_filter):
     c = _CITY_SLUG_MAP.get(c, c)
     return c.replace(" ", "-")
 
+def _city_today_slug(city):
+    """Build today's highest-temperature slug for a city name."""
+    from datetime import date as _date
+    d = _date.today()
+    return (f"highest-temperature-in-{_city_to_slug(city)}-on-"
+            f"{_MONTH_NAMES[d.month-1]}-{d.day}-{d.year}")
+
+def _do_basket(chat, slug, basket):
+    """Buy a basket of DIFFERENT share counts across buckets in one go
+    (e.g. 1×25°C, 4×26°C). Each bucket is placed as its own SHARES order so
+    you get per-bucket success/error feedback; sub-$1 ones rest as limits."""
+    if not _is_highest_temp_slug(slug):
+        send_message(chat, f"❌ <code>{slug}</code> isn't a highest-temperature market.")
+        return
+    city, date = _parse_temp_slug(slug)
+    total = sum(q for _, q in basket)
+    send_message(chat, f"🧺 <b>Basket — {city.title()} ({date})</b>\n"
+                       f"{', '.join(f'{q}×{b}°C' for b, q in basket)}  ({total} sh) …")
+    results, pids = [], []
+    with _order_lock:
+        for bucket, qty in basket:
+            if qty <= 0:
+                continue
+            pid, line = _buy_one(slug, bucket, "YES", city, date, "°C",
+                                 qty, "SHARES", DEFAULT_TP_PRICE, DEFAULT_SL_PRICE, chat)
+            results.append(line)
+            if pid:
+                pids.append(pid)
+    send_message(chat, "<b>🧺 Basket result</b>\n" + "\n\n".join(results))
+    for pid in pids:
+        _send_sell_prompt(pid, chat)
+
+def _parse_basket_args(parts):
+    """['25:1','26:4'] → [('25',1),('26',4)]. Accepts ':' '=' 'x' '×'."""
+    out = []
+    for p in parts:
+        for sep in (":", "=", "x", "×"):
+            if sep in p:
+                bk, qty = p.split(sep, 1)
+                bk = bk.strip().rstrip("°cC")
+                try:
+                    n = int(float(qty))
+                except Exception:
+                    n = 0
+                if bk and n > 0:
+                    out.append((bk, n))
+                break
+    return out
+
 def _send_markets_menu(chat, city_filter=None):
     from datetime import date as _date, timedelta
     send_message(chat, "🔎 Scanning live temperature markets …")
@@ -1092,6 +1141,7 @@ def set_bot_commands():
     cmds = [
         {"command": "menu",      "description": "📋 Main menu"},
         {"command": "markets",   "description": "🛒 Browse markets & buy"},
+        {"command": "basket",    "description": "🧺 Buy a basket (per-bucket qty)"},
         {"command": "positions", "description": "💼 Your positions & sell"},
         {"command": "sell",      "description": "💱 Sell a position"},
         {"command": "test",      "description": "🧪 Buy card for a market"},
@@ -1116,6 +1166,7 @@ def handle_text(msg):
                 "I trade Polymarket 'highest temperature' markets. Use the menu "
                 "or these commands:\n\n"
                 "🛒 /markets [city] — browse live markets &amp; buy\n"
+                "🧺 /basket &lt;city&gt; 25:1 26:4 — buy per-bucket share counts\n"
                 "💼 /positions (/sell) — your positions with Sell buttons\n"
                 "🧪 /test [slug] — buy card for a specific market\n"
                 "📋 /menu — the main menu\n\n"
@@ -1141,6 +1192,24 @@ def handle_text(msg):
                                    f"Pass a live event slug: <code>/test highest-temperature-in-london-on-june-24-2026</code>")
             else:
                 handle_new_signal(sig)
+        elif cmd in ("/basket", "/dca"):
+            # /basket <slug-or-city> 25:1 26:4 27:2
+            parts = text.split()
+            if len(parts) < 3:
+                send_message(chat,
+                    "🧺 <b>Basket buy</b> — different share counts per bucket in one go:\n"
+                    "<code>/basket &lt;city-or-slug&gt; 25:1 26:4 27:2</code>\n"
+                    "e.g. <code>/basket tokyo 22:1 23:4</code> buys 1×22°C + 4×23°C.")
+            else:
+                target = parts[1]
+                slug = target if _is_highest_temp_slug(target) else _city_today_slug(target)
+                basket = _parse_basket_args(parts[2:])
+                if not basket:
+                    send_message(chat, "⚠️ No valid bucket:qty pairs. Example: "
+                                       "<code>/basket tokyo 22:1 23:4</code>")
+                else:
+                    threading.Thread(target=_do_basket, args=(chat, slug, basket),
+                                     daemon=True).start()
         elif cmd in ("/positions", "/sell"):
             threading.Thread(target=_send_positions, args=(chat,), daemon=True).start()
         return
